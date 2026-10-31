@@ -94,6 +94,10 @@ pub enum Error {
         size: u64,
         limit: u64,
     },
+    /// No matching update arrived before a listener's timeout.
+    ListenerTimeout,
+    /// The listener was stopped: by `stop_listening`, or because `run` stopped or isn't running.
+    ListenerStopped,
 }
 
 impl Error {
@@ -136,6 +140,8 @@ impl fmt::Display for Error {
             Error::FileSize { size, limit } => {
                 write!(f, "can't upload {size} bytes: this account can send files of up to {} MiB", limit >> 20)
             }
+            Error::ListenerTimeout => f.write_str("no matching update arrived before the timeout"),
+            Error::ListenerStopped => f.write_str("the listener was stopped"),
         }
     }
 }
