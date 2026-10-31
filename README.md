@@ -95,6 +95,19 @@ existing login over without signing in again. Exports are always `VAE_…`.
 > A session file or string **is** the login: anyone who has it is logged in as that account.
 > Never commit or share it. `*.session` and `*.state` are already in `.gitignore`.
 
+To keep the session and the state somewhere else, such as a database or an encrypted vault, implement
+`storage::SessionStore` (load, save and delete a byte value by name) and pass it in:
+
+```rust
+let app = Client::builder("my_bot", api_id, api_hash)
+    .store(MyStore::new())
+    .start()
+    .await?;
+```
+
+The values are vaegram's own formats, and the `"session"` value is a session string, so the store only keeps bytes.
+It holds the login, so the store has to protect it itself. `storage::MemoryStore` keeps everything in memory.
+
 `.test_mode()` logs in on Telegram's test servers and `.ipv6()` connects over IPv6. Session strings remember
 the test mode and the data center address. `.pfs()` turns on perfect forward secrecy: traffic runs under
 temporary keys that are replaced every day, and only the permanent key is stored. Each temporary key brings its
@@ -177,6 +190,7 @@ keep them private. On Unix only the owner can read the file; on Windows it gets 
 - [x] TL compiler, transport, auth key handshake, encrypted session
 - [x] Bot login, data center migration, `send_message`, `get_me`, raw `invoke`
 - [x] Session files and session strings
+- [ ] Custom session stores: `.store(MyStore)` with `storage::SessionStore` (not yet tested live)
 - [x] Update handlers and filters: `filters::command("start") & filters::private()`
 - [x] Friendly types: `msg.text`, `msg.reply()`, `msg.from_user`
 - [ ] Message media and metadata: `msg.caption`, `msg.entities`, `msg.photo()`, `msg.poll()`, replies and forwards (not yet tested live)
