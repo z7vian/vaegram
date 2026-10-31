@@ -8,6 +8,7 @@ use tokio::time::Instant;
 use crate::client::Me;
 use crate::errors::{Error, Result};
 use crate::filters::{Filter, Inspect, Subject};
+use crate::handlers::Callback;
 use crate::types::{CallbackQuery, InlineMessageId, Message};
 
 static UNEXPECTED_CLICK: LazyLock<Arc<str>> = LazyLock::new(|| "You are not expected to click this button.".into());
@@ -84,6 +85,10 @@ impl Listeners {
         self.messages.close();
         self.callbacks.close();
     }
+
+    pub(crate) fn remove(&self, id: u64) -> bool {
+        self.messages.remove(id) || self.callbacks.remove(id)
+    }
 }
 
 /// Every empty list matches anything; a filled one must contain the update's value.
@@ -151,6 +156,7 @@ struct Entry<T> {
 
 enum Sink<T> {
     Wait(oneshot::Sender<T>),
+    Call(Callback<T>),
 }
 
 struct Shelf<T> {
@@ -176,6 +182,8 @@ pub(crate) enum Offer<T> {
     Unclaimed(T),
     /// Nobody took it, but another user pressed a pinned button: answer with this alert.
     Stranger(T, Arc<str>),
+    /// A next-step handler took it: run the callback with it.
+    Call(Callback<T>, T),
 }
 
 impl<T> Book<T> {
@@ -197,6 +205,7 @@ impl<T> Book<T> {
         if shelf.closed {
             return Err(Error::ListenerStopped);
         }
+        prune(&mut shelf, Instant::now());
         shelf.entries.push(entry);
         self.count(&shelf);
         Ok(())
@@ -234,6 +243,10 @@ impl<T> Book<T> {
         Ok(rx)
     }
 
+    pub(crate) fn call(&self, id: u64, criteria: Criteria<T>, callback: Callback<T>) -> Result<()> {
+        self.add(Entry { id, criteria, sink: Sink::Call(callback) })
+    }
+
     /// Waits for the update `criteria` describes. Dropping the future removes the listener.
     pub(crate) async fn listen(&self, id: u64, criteria: Criteria<T>) -> Result<T> {
         let deadline = criteria.deadline;
@@ -261,7 +274,9 @@ impl<T: Listened> Book<T> {
         let now = Instant::now();
         let (mut candidates, stranger) = {
             let Some(identity) = item.identity(me) else { return Offer::Unclaimed(item) };
-            let shelf = self.shelf();
+            let mut shelf = self.shelf();
+            prune(&mut shelf, now);
+            self.count(&shelf);
             let mut live = shelf.entries.iter().filter(|e| e.criteria.live(now));
             let candidates: Vec<(u64, Option<Arc<Filter<T>>>)> = live
                 .clone()
@@ -282,6 +297,7 @@ impl<T: Listened> Book<T> {
                     Ok(()) => return Offer::Claimed,
                     Err(back) => item = back,
                 },
+                Sink::Call(callback) => return Offer::Call(callback, item),
             }
         }
         match stranger {
@@ -289,6 +305,11 @@ impl<T: Listened> Book<T> {
             None => Offer::Unclaimed(item),
         }
     }
+}
+
+// Waiters remove themselves when their timer fires; expired next-step handlers have nobody to do that.
+fn prune<T>(shelf: &mut Shelf<T>, now: Instant) {
+    shelf.entries.retain(|e| matches!(e.sink, Sink::Wait(_)) || e.criteria.live(now));
 }
 
 struct Guard<'a, T> {
@@ -322,6 +343,11 @@ pub(crate) mod tests {
 
     pub(crate) fn message(client: &Client, id: i32, chat: i64, from: Option<i64>, out: bool) -> Message {
         Message::from_raw(client, raw_message(id, chat, from, out), &Entities::default()).unwrap()
+    }
+
+    pub(crate) fn new_message(id: i32, chat: i64) -> base::Update {
+        let message = raw_message(id, chat, None, false);
+        base::Update::UpdateNewMessage(Box::new(types::UpdateNewMessage { message, pts: 0, pts_count: 0 }))
     }
 
     pub(crate) fn raw_query(user_id: i64, chat: i64, msg_id: i32) -> types::UpdateBotCallbackQuery {
