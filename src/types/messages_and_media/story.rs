@@ -20,10 +20,16 @@ pub struct Story {
     pub is_public: bool,
     pub is_close_friends: bool,
     pub is_edited: bool,
+    client: Client,
 }
 
 impl Story {
-    pub(crate) fn parse(peer: &base::Peer, item: base::StoryItem, entities: &Entities) -> Option<Story> {
+    pub(crate) fn parse(
+        client: &Client,
+        peer: &base::Peer,
+        item: base::StoryItem,
+        entities: &Entities,
+    ) -> Option<Story> {
         let chat = Chat::parse(peer, entities, false);
         let mut story = Story {
             chat,
@@ -39,6 +45,7 @@ impl Story {
             is_public: false,
             is_close_friends: false,
             is_edited: false,
+            client: client.clone(),
         };
         match item {
             base::StoryItem::StoryItemDeleted(_) => return None,
@@ -60,6 +67,10 @@ impl Story {
         Some(story)
     }
 
+    pub fn client(&self) -> &Client {
+        &self.client
+    }
+
     /// Fails at `.await` for a story without a photo or document.
     pub fn download<'a>(&self, client: &'a Client) -> DownloadMedia<'a> {
         let location = self.media.as_ref().and_then(Media::file_location).cloned();
@@ -75,7 +86,7 @@ impl Story {
         chats: Vec<base::Chat>,
     ) -> Vec<Story> {
         let entities = Entities::new(client, users, chats);
-        items.into_iter().filter_map(|item| Story::parse(peer, item, &entities)).collect()
+        items.into_iter().filter_map(|item| Story::parse(client, peer, item, &entities)).collect()
     }
 
     pub(crate) fn from_updates(client: &Client, updates: base::Updates) -> Result<Story> {
@@ -91,7 +102,7 @@ impl Story {
             .find_map(|u| match u {
                 base::Update::UpdateStory(u) => {
                     let u = *u;
-                    Story::parse(&u.peer, u.story, &entities)
+                    Story::parse(client, &u.peer, u.story, &entities)
                 }
                 _ => None,
             })
