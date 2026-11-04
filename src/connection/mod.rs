@@ -1,7 +1,13 @@
 mod fake_tls;
+#[cfg(feature = "websocket")]
+mod http1;
 mod obfuscated;
 mod proxy;
+#[cfg(feature = "websocket")]
+mod tls;
 mod transport;
+#[cfg(feature = "websocket")]
+mod websocket;
 
 pub use proxy::{Proxy, Secret};
 pub use transport::{Framing, RecvBuf, Transport};
@@ -83,6 +89,10 @@ pub struct Options {
     pub observer: Option<Observer>,
     pub record: Option<Recorder>,
     pub device: Device,
+    /// Carries MTProto over WebSocket on TLS (`wss://…web.telegram.org/apiws`), always obfuscated, instead of a
+    /// direct TCP connection: for networks that only let HTTPS through. Set by `ClientBuilder::websocket`.
+    #[cfg(feature = "websocket")]
+    pub websocket: bool,
 }
 
 impl Default for Options {
@@ -99,7 +109,21 @@ impl Default for Options {
             observer: None,
             record: None,
             device: Device::default(),
+            #[cfg(feature = "websocket")]
+            websocket: false,
         }
+    }
+}
+
+impl Options {
+    #[cfg(feature = "websocket")]
+    pub(crate) fn uses_websocket(&self) -> bool {
+        self.websocket
+    }
+
+    #[cfg(not(feature = "websocket"))]
+    pub(crate) fn uses_websocket(&self) -> bool {
+        false
     }
 }
 
@@ -161,7 +185,14 @@ impl Connection {
         if options.transport == Transport::Full && (options.obfuscated || secret.is_some()) {
             return Err(Error::InvalidArgument("the full transport can't be obfuscated or go through an MTProxy"));
         }
-        let (read, mut write) = match &options.connection_factory {
+        #[cfg(feature = "websocket")]
+        if options.websocket {
+            if secret.is_some() || options.transport == Transport::Full {
+                return Err(Error::InvalidArgument("WebSocket can't go through an MTProxy or use the full transport"));
+            }
+            return Self::open_websocket(dc, options, &websocket::Endpoint::of(dc)?).await;
+        }
+        let (read, write) = match &options.connection_factory {
             None => {
                 let stream = match &options.proxy {
                     None => TcpStream::connect(addr).await?,
@@ -189,11 +220,27 @@ impl Connection {
                 (ReadHalf::Boxed(read), WriteHalf::Boxed(write))
             }
         };
+        Self::start(dc, options, read, write, options.obfuscated || secret.is_some()).await
+    }
+
+    #[cfg(feature = "websocket")]
+    async fn open_websocket(dc: &Dc, options: &Options, endpoint: &websocket::Endpoint) -> Result<Self> {
+        let (read, write) = tokio::io::split(websocket::open(endpoint, options).await?);
+        // Telegram's WebSocket endpoints only take obfuscated streams.
+        Self::start(dc, options, ReadHalf::Boxed(read), WriteHalf::Boxed(write), true).await
+    }
+
+    /// Sends what the transport starts with, the obfuscation header or the transport's tag, on a stream just opened.
+    async fn start(dc: &Dc, options: &Options, read: ReadHalf, mut write: WriteHalf, obfuscate: bool) -> Result<Self> {
+        let secret = match &options.proxy {
+            Some(Proxy::MtProxy { secret, .. }) => Some(secret),
+            _ => None,
+        };
         let transport =
             if secret.is_some_and(|s| s.padded) { Transport::PaddedIntermediate } else { options.transport };
         let tls = secret.is_some_and(|s| s.domain.is_some());
         let (encrypt, decrypt, records) = match transport.tag() {
-            Some(tag) if options.obfuscated || secret.is_some() => {
+            Some(tag) if obfuscate => {
                 let (header, encrypt, decrypt) = obfuscated::init(tag, dc.wire_id() as i16, secret.map(|s| &s.key));
                 // Behind fake TLS the header rides in the first record together with the first packet.
                 let records = tls.then(|| RecordWriter::new(header));
@@ -375,6 +422,25 @@ mod tests {
 
     fn full() -> Options {
         Options { transport: Transport::Full, ..Options::default() }
+    }
+
+    #[cfg(feature = "websocket")]
+    #[tokio::test]
+    async fn websocket_refuses_mtproxy_and_full() {
+        // A data center with no WebSocket name: getting past the refusal would fail differently.
+        let dc = Dc { id: 9, addr: "127.0.0.1:9".parse().unwrap(), test: false };
+        let secret = "00".repeat(16).parse().unwrap();
+        let mtproxy = Proxy::MtProxy { host: "127.0.0.1".into(), port: 9, secret };
+        let websocket = Options { websocket: true, ..Options::default() };
+        let refused = [
+            Options { proxy: Some(mtproxy), ..websocket.clone() },
+            Options { transport: Transport::Full, ..websocket.clone() },
+        ];
+        for options in refused {
+            let result = Connection::connect(&dc, &options).await;
+            assert!(matches!(result, Err(Error::InvalidArgument(_))), "{options:?}");
+        }
+        assert!(matches!(Connection::connect(&dc, &websocket).await, Err(Error::InvalidDc(9))));
     }
 
     #[tokio::test]
