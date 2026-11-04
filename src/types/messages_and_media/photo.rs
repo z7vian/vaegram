@@ -1,6 +1,6 @@
 use crate::file_id::{FileId, FileType, ThumbnailSource, unique_id};
 use crate::raw::base;
-use crate::types::FileLocation;
+use crate::types::{FileLocation, Thumbnail};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Photo {
@@ -12,6 +12,8 @@ pub struct Photo {
     pub height: i32,
     pub file_size: i64,
     pub date: i32,
+    /// Smaller sizes of the photo.
+    pub thumbs: Vec<Thumbnail>,
     pub(crate) location: FileLocation,
 }
 
@@ -40,7 +42,36 @@ impl Photo {
             height,
             file_size: file_size.into(),
             date: p.date,
+            thumbs: Thumbnail::from_photo(p),
             location: FileLocation { file_size: Some(file_size.into()), ..FileLocation::from(&file_id) },
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Photo;
+    use crate::raw::{base, types};
+
+    #[test]
+    fn parses_thumbs() {
+        let size = |letter: &str, w, h, bytes| {
+            base::PhotoSize::PhotoSize(Box::new(types::PhotoSize { r#type: letter.into(), w, h, size: bytes }))
+        };
+        let raw = types::Photo {
+            has_stickers: false,
+            id: 7,
+            access_hash: 8,
+            file_reference: vec![9],
+            date: 0,
+            sizes: vec![size("s", 90, 60, 1_000), size("x", 1280, 853, 90_000)],
+            video_sizes: None,
+            dc_id: 2,
+        };
+        let photo = Photo::parse(&base::Photo::Photo(Box::new(raw))).unwrap();
+        assert_eq!((photo.width, photo.height), (1280, 853));
+        assert_eq!(photo.thumbs.len(), 1);
+        assert_eq!((photo.thumbs[0].width, photo.thumbs[0].height), (90, 60));
+        assert_ne!(photo.thumbs[0].file_unique_id, photo.file_unique_id);
     }
 }
