@@ -14,6 +14,7 @@ impl Client {
             let types::users::UserFull { full_user: base::UserFull::UserFull(mut user), chats, users } = *full;
             let entities = Entities::new(self, users, chats);
             let mut chat = Chat::parse(&get_peer(chat_id), &entities, false);
+            add_full_photo(&mut chat, user.profile_photo.as_ref());
             chat.bio = user.about.take().filter(|about| !about.is_empty());
             chat.community = Community::linked(chat_id, &entities);
             chat.full_info = Some(Box::new(ChatFullInfo::parse_user(*user, &entities)));
@@ -27,6 +28,7 @@ impl Client {
         };
         let (about, info) = match full_chat {
             base::ChatFull::ChatFull(c) => {
+                add_full_photo(&mut chat, c.chat_photo.as_ref());
                 chat.invite_link = invite(&c.exported_invite);
                 if let base::ChatParticipants::ChatParticipants(p) = &c.participants {
                     chat.members_count = Some(p.participants.len() as i32);
@@ -35,18 +37,29 @@ impl Client {
                 (std::mem::take(&mut c.about), ChatFullInfo::parse_chat(c))
             }
             base::ChatFull::ChannelFull(c) => {
+                add_full_photo(&mut chat, Some(&c.chat_photo));
                 chat.invite_link = invite(&c.exported_invite);
                 chat.members_count = c.participants_count.or(chat.members_count);
                 chat.guard_bot = c.guard_bot_id.map(|id| User::parse(id, &entities));
                 let mut c = *c;
                 (std::mem::take(&mut c.about), ChatFullInfo::parse_channel(c, &entities))
             }
-            base::ChatFull::CommunityFull(mut c) => (std::mem::take(&mut c.about), ChatFullInfo::parse_community(&c)),
+            base::ChatFull::CommunityFull(mut c) => {
+                add_full_photo(&mut chat, Some(&c.chat_photo));
+                (std::mem::take(&mut c.about), ChatFullInfo::parse_community(&c))
+            }
         };
         chat.full_info = Some(Box::new(info));
         chat.description = (!about.is_empty()).then_some(about);
         chat.community = Community::linked(chat_id, &entities);
         Ok(chat)
+    }
+}
+
+/// Adds the video and sticker of the full reply's photo to the chat's photo, when it is the same photo.
+fn add_full_photo(chat: &mut Chat, full: Option<&base::Photo>) {
+    if let (Some(base::Photo::Photo(full)), Some(photo)) = (full, chat.photo.take()) {
+        chat.photo = Some(photo.with_full(full));
     }
 }
 
@@ -276,6 +289,38 @@ mod tests {
         id.serialize(&mut buf);
         access_hash.serialize(&mut buf);
         base::User::User(types::User::deserialize_bare(&mut &buf[..]).unwrap().into())
+    }
+
+    #[tokio::test]
+    async fn full_photo_adds_animation() {
+        let video = types::VideoSize { r#type: "u".into(), w: 800, h: 800, size: 20, video_start_ts: Some(0.5) };
+        let full_photo = types::Photo {
+            has_stickers: false,
+            id: 55,
+            access_hash: 1,
+            file_reference: Vec::new(),
+            date: 0,
+            sizes: Vec::new(),
+            video_sizes: Some(vec![base::VideoSize::VideoSize(video.into())]),
+            dc_id: 4,
+        };
+        let profile =
+            types::UserProfilePhoto { has_video: true, personal: false, photo_id: 55, stripped_thumb: None, dc_id: 4 };
+        let base::User::User(user) = raw_user(USER, 77) else { unreachable!() };
+        let user = types::User { photo: Some(base::UserProfilePhoto::UserProfilePhoto(profile.into())), ..*user };
+        let full = types::UserFull { profile_photo: Some(base::Photo::Photo(full_photo.into())), ..user_full(USER) };
+        let reply = types::users::UserFull {
+            full_user: base::UserFull::UserFull(full.into()),
+            chats: Vec::new(),
+            users: vec![base::User::User(user.into())],
+        };
+        let reply = base::users::UserFull::UserFull(reply.into()).to_bytes();
+        let (client, _rx) = Client::scripted(vec![Ok(reply)]);
+        let peer = types::InputPeerUser { user_id: USER, access_hash: 77 };
+        client.0.peers.lock().unwrap().insert(USER, base::InputPeer::InputPeerUser(Box::new(peer)));
+        let chat = client.get_chat(USER).await.unwrap();
+        let animation = chat.photo.unwrap().animation.expect("an animation");
+        assert_eq!((animation.length, animation.main_frame_timestamp), (800, Some(0.5)));
     }
 
     fn recipients() -> base::BusinessRecipients {
