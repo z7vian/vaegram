@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::Client;
 use crate::dispatcher::Entities;
@@ -7,6 +8,9 @@ use crate::raw::{base, functions, types};
 use crate::storage::input_peer;
 use crate::types::PeerRef;
 use crate::utils::{CHANNEL_OFFSET, chats_of, input_user};
+
+/// How long a username learned from Telegram is trusted before it is looked up again: names change hands.
+const USERNAME_TTL: Duration = Duration::from_secs(8 * 60 * 60);
 
 pub(crate) enum ChatPeer {
     Group(i64),
@@ -22,7 +26,7 @@ impl Client {
         let chat_id = match chat {
             PeerRef::Id(id) => *id,
             PeerRef::Me => return Ok((self.0.me.lock().unwrap().id, base::InputPeer::InputPeerSelf)),
-            PeerRef::Username(name) => self.resolve_username(name).await?,
+            PeerRef::Username(name) => self.username_id(name).await?,
             PeerRef::Invite(hash) => {
                 let request = functions::messages::CheckChatInvite { hash: String::from(&**hash) };
                 let chat = match self.invoke(&request).await? {
@@ -35,6 +39,25 @@ impl Client {
             }
         };
         Ok((chat_id, self.resolve_id(chat_id).await?))
+    }
+
+    /// A username's peer: from memory or the store while the name is fresh, else from Telegram.
+    async fn username_id(&self, name: &str) -> Result<i64> {
+        let name = name.trim_start_matches('@').to_ascii_lowercase();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+        let fresh = |updated: i64| now.saturating_sub(updated) <= USERNAME_TTL.as_secs() as i64;
+        let cached = self.0.peers.lock().unwrap().by_username(&name);
+        if let Some((id, _)) = cached.filter(|&(_, updated)| fresh(updated)) {
+            return Ok(id);
+        }
+        if let Some(record) = self.0.store.get_peer_by_username(name.clone()).await? {
+            if fresh(record.updated) && input_peer(record.id, record.access_hash).is_some() {
+                let id = record.id;
+                self.0.peers.lock().unwrap().load([record]);
+                return Ok(id);
+            }
+        }
+        self.resolve_username(&name).await
     }
 
     async fn resolve_id(&self, chat_id: i64) -> Result<base::InputPeer> {
@@ -271,5 +294,38 @@ mod tests {
         let (client, _sent) = Client::scripted(vec![Ok(invite.to_bytes())]);
         let result = client.resolve_peer("t.me/+AbC").await;
         assert!(matches!(result, Err(Error::ChatNotJoined)), "{result:?}");
+    }
+
+    fn user_named(id: i64, username: &str) -> base::User {
+        let mut buf = Vec::new();
+        // flags: access_hash (bit 0) and username (bit 3)
+        0b1001u32.serialize(&mut buf);
+        0u32.serialize(&mut buf);
+        id.serialize(&mut buf);
+        7i64.serialize(&mut buf);
+        username.to_owned().serialize(&mut buf);
+        base::User::User(Box::new(types::User::deserialize_bare(&mut &buf[..]).unwrap()))
+    }
+
+    #[tokio::test]
+    async fn a_fresh_username_is_resolved_without_a_request() {
+        let (client, mut sent) = Client::scripted(Vec::new());
+        crate::dispatcher::Entities::new(&client, vec![user_named(100, "Alice")], Vec::new());
+        let (id, _) = client.resolve(&PeerRef::Username("@alice".into())).await.unwrap();
+        assert_eq!(id, 100);
+        assert!(sent.try_recv().is_err(), "a request went out");
+    }
+
+    #[tokio::test]
+    async fn a_stale_username_is_looked_up_again() {
+        let (client, mut sent) = Client::scripted(vec![Err(Error::Unexpected("offline"))]);
+        let mut old = crate::storage::PeerRecord::new(100, 7);
+        (old.usernames, old.updated) = (vec!["alice".into()], 1);
+        client.0.peers.lock().unwrap().load([old]);
+        let _ = client.resolve(&PeerRef::Username("alice".into())).await;
+        assert_eq!(
+            sent.try_recv().map(|b| u32::from_le_bytes(b[..4].try_into().unwrap())).ok(),
+            Some(contacts::ResolveUsername::CONSTRUCTOR_ID)
+        );
     }
 }
