@@ -1,6 +1,11 @@
 //! The full client against a loopback DC (`support/mockdc.rs`) at 0/10/40 ms of added latency.
-//! `cargo bench --bench session` prints one JSON line per result.
+//! `cargo bench --bench session` prints one JSON line per result. The `cpu_ms_per_mib_*` rows (Linux only) count
+//! the whole process, so the in-process mock DC's own work is in them too: compare them only against the same
+//! mock DC on the same kind of runner. They come from per-thread schedstat nanoseconds; the `*_ticks` rows
+//! repeat them from /proc/self/stat's 10 ms ticks as a diagnostic, never as the number to compare.
 
+#[path = "support/cpu.rs"]
+mod cpu;
 #[path = "support/mockdc.rs"]
 mod mockdc;
 
@@ -17,6 +22,8 @@ const WINDOW: Duration = Duration::from_secs(2);
 const PART: usize = 512 * 1024;
 const TRANSFER_PARTS: usize = 256;
 const TRANSFER_DEPTH: usize = 8;
+// Each transfer runs this many times and reports its median, so one noisy round can't move a row.
+const TRANSFER_ROUNDS: usize = 5;
 const UPDATES: u64 = 20_000;
 const ECHOES: u64 = 10_000;
 // Pushes stay this far ahead of the handler, so the client's update channel never overflows.
@@ -37,6 +44,47 @@ fn report_rss(when: &str) {
     };
     if let (Some(rss), Some(hwm)) = (field("VmRSS:"), field("VmHWM:")) {
         println!("{{\"case\":\"rss_{when}\",\"rss_kib\":{rss},\"hwm_kib\":{hwm}}}");
+    }
+}
+
+/// The median, min and max of `values`.
+fn spread(mut values: Vec<f64>) -> (f64, f64, f64) {
+    values.sort_by(f64::total_cmp);
+    (values[values.len() / 2], values[0], values[values.len() - 1])
+}
+
+fn report_cpu(case: &str, latency_ms: u64, ms_per_mib: Vec<f64>) {
+    let (median, min, max) = spread(ms_per_mib);
+    println!(
+        "{{\"case\":\"{case}\",\"latency_ms\":{latency_ms},\"value\":{median:.2},\"min\":{min:.2},\"max\":{max:.2},\
+         \"rounds\":{TRANSFER_ROUNDS},\"unit\":\"cpu ms/MiB\"}}"
+    );
+}
+
+/// The transfer's median MiB/s over its rounds, then (Linux only) the CPU milliseconds the process spent per MiB
+/// moved: median, min and max.
+async fn measured_transfer(client: &Client, upload: bool, latency_ms: u64) {
+    let direction = if upload { "upload" } else { "download" };
+    let mib = (TRANSFER_PARTS * PART) as f64 / (1 << 20) as f64;
+    let (mut rates, mut on_cpu, mut ticks) = (Vec::new(), Vec::new(), Vec::new());
+    for _ in 0..TRANSFER_ROUNDS {
+        let before = cpu::sample();
+        rates.push(transfer(client, upload).await);
+        let (Some((ns_before, ticks_before)), Some((ns_after, ticks_after))) = (before, cpu::sample()) else {
+            continue;
+        };
+        // Saturating: a thread that ended mid-round takes its time with it.
+        on_cpu.push(ns_after.saturating_sub(ns_before) as f64 / 1e6 / mib);
+        if let (Some(before), Some(after)) = (ticks_before, ticks_after) {
+            ticks.push(after.saturating_sub(before) as f64 / mib);
+        }
+    }
+    report(direction, latency_ms, spread(rates).0, "MiB/s");
+    if on_cpu.len() == TRANSFER_ROUNDS {
+        report_cpu(&format!("cpu_ms_per_mib_{direction}"), latency_ms, on_cpu);
+    }
+    if ticks.len() == TRANSFER_ROUNDS {
+        report_cpu(&format!("cpu_ms_per_mib_{direction}_ticks"), latency_ms, ticks);
     }
 }
 
@@ -159,9 +207,9 @@ async fn bench(latency_ms: u64) {
     report("echo", latency_ms, pushed(&mock, || stats.sent.load(Ordering::Relaxed), ECHOES).await, "round trips/s");
     echo.store(false, Ordering::Relaxed);
 
-    report("upload", latency_ms, transfer(&client, true).await, "MiB/s");
-    report("download", latency_ms, transfer(&client, false).await, "MiB/s");
-    assert_eq!(mock.stats.parts_saved.load(Ordering::Relaxed), TRANSFER_PARTS as u64);
+    measured_transfer(&client, true, latency_ms).await;
+    measured_transfer(&client, false, latency_ms).await;
+    assert_eq!(mock.stats.parts_saved.load(Ordering::Relaxed), (TRANSFER_PARTS * TRANSFER_ROUNDS) as u64);
     runner.abort();
     report_rss(&format!("after_{latency_ms}ms"));
 }
