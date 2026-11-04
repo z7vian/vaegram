@@ -1,5 +1,6 @@
 #[cfg(test)]
 pub(crate) mod conformance;
+mod copy;
 mod engine;
 mod file_format;
 mod file_storage;
@@ -9,6 +10,7 @@ pub mod recording;
 pub mod session_string;
 mod store;
 
+pub use copy::copy;
 pub use engine::{PeerRecord, Storage, StorageFuture, StoredState};
 pub use file_storage::FileStorage;
 pub use memory_storage::MemoryStorage;
