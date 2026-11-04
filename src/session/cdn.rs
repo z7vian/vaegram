@@ -45,20 +45,21 @@ impl<'a> Cdn<'a> {
         Ok(cdn)
     }
 
-    pub(crate) async fn part(&self, session: &Session, offset: i64, limit: i32) -> Result<Vec<u8>> {
+    /// `in_flight`: the parts each connection carries, the master's included, which sets how long one may take.
+    pub(crate) async fn part(&self, session: &Session, offset: i64, limit: i32, in_flight: usize) -> Result<Vec<u8>> {
         let mut reuploads = 0;
         let mut bytes = loop {
             let request = functions::upload::GetCdnFile { file_token: self.token.clone(), offset, limit };
             // The server keeps initConnection with the auth key, which all of this download's CDN connections share.
             let file = if self.inited.swap(true, Ordering::AcqRel) {
-                invoke_cdn_part(session, &request).await?
+                invoke_cdn_part(session, &request, in_flight).await?
             } else {
                 let (api_id, options) = self.init;
                 let mut init = init_connection(api_id, options, request);
                 // The CDN gets no private info (https://core.telegram.org/cdn): no device, no MTProxy address.
                 (init.query.device_model, init.query.system_version) = ("n/a".into(), "n/a".into());
                 init.query.proxy = None;
-                invoke_cdn_part(session, &init).await?
+                invoke_cdn_part(session, &init, in_flight).await?
             };
             match file {
                 base::upload::CdnFile::CdnFile(f) => break f.bytes,
@@ -67,7 +68,7 @@ impl<'a> Cdn<'a> {
                         file_token: self.token.clone(),
                         request_token: r.request_token,
                     };
-                    self.add(invoke_part(self.master, &reupload).await?);
+                    self.add(invoke_part(self.master, &reupload, in_flight).await?);
                     reuploads += 1;
                 }
                 base::upload::CdnFile::CdnFileReuploadNeeded(_) => {
@@ -88,7 +89,7 @@ impl<'a> Cdn<'a> {
             }
             let at = offset + checked as i64;
             let request = functions::upload::GetCdnFileHashes { file_token: self.token.clone(), offset: at };
-            self.add(invoke_part(self.master, &request).await?);
+            self.add(invoke_part(self.master, &request, in_flight).await?);
             if !self.hashes.read().unwrap().contains_key(&at) {
                 return Err(Error::Security("the master DC has no hash for a CDN file part"));
             }
@@ -99,7 +100,7 @@ impl<'a> Cdn<'a> {
         if bytes.len() < limit as usize {
             if !self.hashes.read().unwrap().contains_key(&end) {
                 let request = functions::upload::GetCdnFileHashes { file_token: self.token.clone(), offset: end };
-                self.add(invoke_part(self.master, &request).await?);
+                self.add(invoke_part(self.master, &request, in_flight).await?);
             }
             if self.hashes.read().unwrap().contains_key(&end) {
                 return Err(Error::Unexpected("upload.getCdnFile returned a short part before the end"));
@@ -226,7 +227,7 @@ mod tests {
             file_hashes: Vec::new(),
         };
         let options = Options::default();
-        let part = Cdn::new(&master, redirect, (0, &options)).unwrap().part(&cdn, 0, 4096).await.unwrap();
+        let part = Cdn::new(&master, redirect, (0, &options)).unwrap().part(&cdn, 0, 4096, 1).await.unwrap();
         assert_eq!(part, plain);
         let hashes = upload::GetCdnFileHashes::CONSTRUCTOR_ID;
         let calls = [upload::ReuploadCdnFile::CONSTRUCTOR_ID, hashes, hashes];
@@ -259,8 +260,8 @@ mod tests {
         let options = Options::default();
         let cdn = Cdn::new(&master, redirect(hashes), (0, &options)).unwrap();
         let (session, _) = Session::scripted(vec![Ok(encrypted(&plain)), Ok(encrypted(&plain))]);
-        assert!(matches!(cdn.part(&session, 0, 128).await, Err(Error::Unexpected(_))));
-        assert!(matches!(cdn.part(&session, 0, 4096).await, Err(Error::Unexpected(_))));
+        assert!(matches!(cdn.part(&session, 0, 128, 1).await, Err(Error::Unexpected(_))));
+        assert!(matches!(cdn.part(&session, 0, 4096, 1).await, Err(Error::Unexpected(_))));
     }
 
     #[tokio::test]
@@ -273,7 +274,7 @@ mod tests {
             let (session, _) = Session::scripted(vec![Ok(encrypted(&plain))]);
             let hashes = hashes();
             let options = &options;
-            async move { Cdn::new(&master, redirect(hashes), (0, options)).unwrap().part(&session, 0, 4096).await }
+            async move { Cdn::new(&master, redirect(hashes), (0, options)).unwrap().part(&session, 0, 4096, 1).await }
         };
         assert!(matches!(part(vec![file_hash(256, b"more")]).await, Err(Error::Unexpected(_))));
         assert_eq!(part(Vec::new()).await.unwrap(), plain);
@@ -286,7 +287,7 @@ mod tests {
         let options = Options::default();
         let cdn = Cdn::new(&master, redirect(Vec::new()), (0, &options)).unwrap();
         let (session, mut asked) = Session::scripted((0..6).map(|_| flood()).collect());
-        let part = cdn.part(&session, 0, 4096).await;
+        let part = cdn.part(&session, 0, 4096, 1).await;
         assert!(matches!(&part, Err(Error::Rpc(e)) if e.code == 420), "{part:?}");
         assert_eq!(std::iter::from_fn(|| asked.try_recv().ok()).count(), 6);
     }

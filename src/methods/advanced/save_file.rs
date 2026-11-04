@@ -8,7 +8,7 @@ use crate::crypto::random;
 use crate::errors::{Error, Result};
 use crate::raw::{base, functions, types};
 use crate::session::Session;
-use crate::session::transfer::{Progress, Report, invoke_part, take, try_join_all, workers};
+use crate::session::transfer::{Pace, Progress, Report, invoke_paced, per_connection, take, try_join_all, workers};
 use crate::types::Upload;
 
 // https://core.telegram.org/api/files#uploading-files
@@ -16,7 +16,9 @@ const PART_SIZE: u64 = 512 * 1024;
 const BIG_FILE_SIZE: u64 = 10 * 1024 * 1024;
 const MAX_PARTS: u64 = 4000;
 const MAX_PARTS_PREMIUM: u64 = 8000;
+// Parts in flight: up to 8 MB while Telegram takes them, back to 4 MB after a FLOOD_WAIT (see `Pace`).
 const IN_FLIGHT: u64 = 4 << 20;
+const IN_FLIGHT_MAX: u64 = 8 << 20;
 const CONNECTIONS: usize = 4;
 // The server throttles Premium uploads less, so more connections stay busy.
 const CONNECTIONS_PREMIUM: usize = 8;
@@ -74,10 +76,14 @@ impl<'a> SaveFile<'a> {
         let (parts, workers, connections) = self.client.upload_limits(size).await?;
         let home = self.client.dc(self.client.session().dc_id())?;
         let lease = self.client.transfer_sessions(home, connections).await?;
-        let upload = Parts { source, size, count: parts, big: size > BIG_FILE_SIZE, id: i64::from_le_bytes(random()) };
+        let big = size > BIG_FILE_SIZE;
+        let in_flight = per_connection(workers, lease.sessions.len());
+        let upload = Parts { source, size, count: parts, big, id: i64::from_le_bytes(random()), in_flight };
         let (next, progress) = (AtomicI32::new(0), Progress::new(self.progress, size));
-        let sessions = &lease.sessions;
-        try_join_all((0..workers).map(|i| upload.send(&sessions[i % sessions.len()], &next, &progress))).await?;
+        let pace = Pace::new((IN_FLIGHT / PART_SIZE) as usize, workers);
+        let (sessions, pace) = (&lease.sessions, &pace);
+        let send = |i: usize| upload.send(&sessions[i % sessions.len()], &next, &progress, pace);
+        try_join_all((0..workers).map(send)).await?;
         Ok(upload.input_file(name))
     }
 }
@@ -91,7 +97,7 @@ impl Client {
             premium => premium.unwrap_or(false),
         };
         let parts = part_count(size, premium)?;
-        let workers = workers(parts, PART_SIZE, IN_FLIGHT);
+        let workers = workers(parts, PART_SIZE, IN_FLIGHT_MAX);
         Ok((parts, workers, workers.min(if premium { CONNECTIONS_PREMIUM } else { CONNECTIONS })))
     }
 }
@@ -116,6 +122,8 @@ struct Parts<'a> {
     count: i32,
     big: bool,
     id: i64,
+    // Parts queued on each connection at most, which sets how long one may take.
+    in_flight: usize,
 }
 
 impl Parts<'_> {
@@ -151,18 +159,18 @@ impl Parts<'_> {
         Ok(Some(part))
     }
 
-    async fn send(&self, session: &Session, next: &AtomicI32, progress: &Progress<'_>) -> Result<()> {
+    async fn send(&self, session: &Session, next: &AtomicI32, progress: &Progress<'_>, pace: &Pace) -> Result<()> {
         let (file_id, mut bytes) = (self.id, Vec::with_capacity(PART_SIZE.min(self.size) as usize));
         while let Some(file_part) = self.read(next, &mut bytes).await? {
             let saved = if self.big {
                 let total = self.count;
                 let request = functions::upload::SaveBigFilePart { file_id, file_part, file_total_parts: total, bytes };
-                let saved = invoke_part(session, &request).await;
+                let saved = invoke_paced(session, &request, pace, self.in_flight).await;
                 bytes = request.bytes;
                 saved
             } else {
                 let request = functions::upload::SaveFilePart { file_id, file_part, bytes };
-                let saved = invoke_part(session, &request).await;
+                let saved = invoke_paced(session, &request, pace, self.in_flight).await;
                 bytes = request.bytes;
                 saved
             };
@@ -219,7 +227,7 @@ mod tests {
         let big = MAX_PARTS * PART_SIZE + 1;
 
         assert_eq!(client.upload_limits(3 << 20).await.unwrap(), (6, 6, 4));
-        assert!(matches!(client.upload_limits(big).await, Ok((4001, 8, 8))));
+        assert!(matches!(client.upload_limits(big).await, Ok((4001, 16, 8))));
         assert_eq!(lookups(), 2);
         assert_eq!(client.upload_limits(3 << 20).await.unwrap(), (6, 6, 6));
         assert_eq!(lookups(), 0);
@@ -254,7 +262,7 @@ mod tests {
     async fn split_from(source: Source<'_>, data: &[u8]) -> Vec<usize> {
         let count = part_count(data.len() as u64, false).unwrap();
         let big = data.len() as u64 > BIG_FILE_SIZE;
-        let parts = Parts { source, size: data.len() as u64, count, big, id: 7 };
+        let parts = Parts { source, size: data.len() as u64, count, big, id: 7, in_flight: 1 };
         let (next, mut sizes, mut joined, mut buf) = (AtomicI32::new(0), Vec::new(), Vec::new(), Vec::new());
         while let Some(n) = parts.read(&next, &mut buf).await.unwrap() {
             assert_eq!(n as usize, sizes.len());
@@ -286,7 +294,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_short_stream_fails_with_unexpected_eof() {
-        let parts = Parts { source: stream(b"hello"), size: 10, count: 1, big: false, id: 7 };
+        let parts = Parts { source: stream(b"hello"), size: 10, count: 1, big: false, id: 7, in_flight: 1 };
         let e = parts.read(&AtomicI32::new(0), &mut Vec::new()).await.err();
         assert!(matches!(&e, Some(Error::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof), "{e:?}");
     }
@@ -337,7 +345,7 @@ mod tests {
         let file = |size: u64| {
             let big = size > BIG_FILE_SIZE;
             let count = part_count(size, false).unwrap();
-            Parts { source: Source::Bytes(&[]), size, count, big, id: 7 }.input_file("a.bin")
+            Parts { source: Source::Bytes(&[]), size, count, big, id: 7, in_flight: 1 }.input_file("a.bin")
         };
         let base::InputFile::InputFile(small) = file(BIG_FILE_SIZE) else { panic!("10 MB is still a small file") };
         assert_eq!((small.id, small.parts, small.name.as_str(), small.md5_checksum.as_str()), (7, 20, "a.bin", ""));
