@@ -1,15 +1,18 @@
 mod add_contact;
 mod block_user;
 mod delete_contacts;
+mod export_no_paid_messages_token;
 mod get_blocked_message_senders;
 mod get_contacts;
 mod get_contacts_count;
 mod import_contacts;
+mod import_no_paid_messages_token;
 mod search_contacts;
 mod set_contact_note;
 mod unblock_user;
 
 pub use add_contact::AddContact;
+pub use export_no_paid_messages_token::ExportNoPaidMessagesToken;
 pub use set_contact_note::SetContactNote;
 
 #[cfg(test)]
