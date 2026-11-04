@@ -4,6 +4,7 @@ use crate::Client;
 use crate::dispatcher::Entities;
 use crate::errors::{Error, Result};
 use crate::raw::{base, functions, types};
+use crate::storage::input_peer;
 use crate::types::PeerRef;
 use crate::utils::{CHANNEL_OFFSET, chats_of, input_user};
 
@@ -42,6 +43,15 @@ impl Client {
         }
         if chat_id == self.0.me.lock().unwrap().id {
             return Ok(base::InputPeer::InputPeerSelf);
+        }
+        // A peer saved in an earlier run: one hop to the store thread, no request. Basic groups need no hash.
+        if chat_id > 0 || chat_id <= -CHANNEL_OFFSET {
+            if let Some(record) = self.0.store.get_peer(chat_id).await? {
+                if let Some(peer) = input_peer(record.id, record.access_hash) {
+                    self.0.peers.lock().unwrap().load([record]);
+                    return Ok(peer);
+                }
+            }
         }
 
         let peer = if chat_id > 0 {
