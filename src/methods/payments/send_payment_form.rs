@@ -1,6 +1,5 @@
 use crate::Client;
 use crate::errors::{Error, Result};
-use crate::methods::into_future;
 use crate::raw::{base, functions};
 use crate::types::{InputCredentials, PaymentForm, PaymentResult, StarAmount};
 
@@ -433,22 +432,22 @@ pub(super) mod tests {
     #[tokio::test]
     async fn ton_cap_pays_a_ton_form() {
         let ton = StarAmount { amount: 5, nanostar_amount: 0, ton: true };
-        let (client, mut sent) = client(vec![gift_form("TON", 5), paid()]);
-        client.pay_form_up_to(slug(), ton).await.unwrap();
+        let (first, mut sent) = client(vec![gift_form("TON", 5), paid()]);
+        first.pay_form_up_to(slug(), ton).await.unwrap();
         let [get, pay] = payment(slug());
         assert_eq!(sent.try_recv().unwrap(), get);
         assert_eq!(sent.try_recv().unwrap(), pay);
         assert!(sent.try_recv().is_err());
 
         // A Toncoin cap never pays a Stars form, and a Stars cap never pays a Toncoin one.
-        let (client, mut sent) = client(vec![gift_form("XTR", 5), gift_form("TON", 5)]);
-        assert!(matches!(client.pay_form_up_to(slug(), ton).await, Err(Error::Unexpected(_))));
-        assert!(matches!(client.pay_in_stars_up_to(slug(), 5).await, Err(Error::Unexpected(_))));
+        let (second, mut sent) = client(vec![gift_form("XTR", 5), gift_form("TON", 5)]);
+        assert!(matches!(second.pay_form_up_to(slug(), ton).await, Err(Error::Unexpected(_))));
+        assert!(matches!(second.pay_in_stars_up_to(slug(), 5).await, Err(Error::Unexpected(_))));
         sent.try_recv().unwrap();
         sent.try_recv().unwrap();
         assert!(sent.try_recv().is_err());
-        let (client, mut sent) = client(vec![gift_form("TON", 6)]);
-        assert!(matches!(client.pay_form_up_to(slug(), ton).await, Err(Error::InvalidArgument(_))));
+        let (third, mut sent) = client(vec![gift_form("TON", 6)]);
+        assert!(matches!(third.pay_form_up_to(slug(), ton).await, Err(Error::InvalidArgument(_))));
         sent.try_recv().unwrap();
         assert!(sent.try_recv().is_err());
     }
