@@ -16,35 +16,34 @@ impl Entities {
         let mut entities = Entities::default();
         for user in users {
             if let base::User::User(u) = &user {
+                // A min user's hash is only good for the message that carried it.
                 if let (false, Some(access_hash)) = (u.min, u.access_hash) {
-                    let peer = types::InputPeerUser { user_id: u.id, access_hash };
-                    peers.insert(u.id, base::InputPeer::InputPeerUser(Box::new(peer)));
+                    let names = active(&u.username, &u.usernames);
+                    peers.remember(u.id, access_hash, &names, u.phone.as_deref());
                 }
                 entities.users.insert(u.id, user);
             }
         }
         for chat in chats {
-            let (id, peer) = match &chat {
-                base::Chat::Chat(c) => (-c.id, None),
-                base::Chat::ChatForbidden(c) => (-c.id, None),
+            let id = match &chat {
+                base::Chat::Chat(c) => -c.id,
+                base::Chat::ChatForbidden(c) => -c.id,
                 base::Chat::Channel(c) => {
-                    let peer = match (c.min, c.access_hash) {
-                        (false, Some(access_hash)) => Some(types::InputPeerChannel { channel_id: c.id, access_hash }),
-                        _ => None,
-                    };
-                    (get_channel_id(c.id), peer)
+                    let id = get_channel_id(c.id);
+                    if let (false, Some(access_hash)) = (c.min, c.access_hash) {
+                        peers.remember(id, access_hash, &active(&c.username, &c.usernames), None);
+                    }
+                    id
                 }
-                base::Chat::ChannelForbidden(c) => (
-                    get_channel_id(c.id),
-                    Some(types::InputPeerChannel { channel_id: c.id, access_hash: c.access_hash }),
-                ),
-                base::Chat::Community(c) => (get_channel_id(c.id), None),
-                base::Chat::CommunityForbidden(c) => (get_channel_id(c.id), None),
+                base::Chat::ChannelForbidden(c) => {
+                    let id = get_channel_id(c.id);
+                    peers.remember(id, c.access_hash, &[], None);
+                    id
+                }
+                base::Chat::Community(c) => get_channel_id(c.id),
+                base::Chat::CommunityForbidden(c) => get_channel_id(c.id),
                 _ => continue,
             };
-            if let Some(peer) = peer {
-                peers.insert(id, base::InputPeer::InputPeerChannel(Box::new(peer)));
-            }
             entities.chats.insert(id, chat);
         }
         entities
@@ -96,4 +95,13 @@ impl Entities {
         };
         peers.insert(id, sender);
     }
+}
+
+/// The names a user or channel can be found by: its username, or its active collectible ones.
+fn active<'a>(username: &'a Option<String>, usernames: &'a Option<Vec<base::Username>>) -> Vec<&'a str> {
+    if let Some(name) = username {
+        return vec![name.as_str()];
+    }
+    let names = usernames.iter().flatten().map(|base::Username::Username(u)| u);
+    names.filter(|u| u.active).map(|u| u.username.as_str()).collect()
 }
