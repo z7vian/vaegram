@@ -4,6 +4,8 @@ mod engine;
 mod file_format;
 mod file_storage;
 mod memory_storage;
+#[cfg(feature = "mongodb")]
+mod mongo_storage;
 pub mod recording;
 #[cfg(feature = "redis")]
 mod redis_storage;
@@ -14,6 +16,8 @@ mod store;
 pub use engine::{PeerRecord, Storage, StorageFuture, StoredState};
 pub use file_storage::FileStorage;
 pub use memory_storage::MemoryStorage;
+#[cfg(feature = "mongodb")]
+pub use mongo_storage::MongoStorage;
 #[cfg(feature = "redis")]
 pub use redis_storage::RedisStorage;
 #[cfg(test)]
