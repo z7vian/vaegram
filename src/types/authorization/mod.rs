@@ -1,4 +1,5 @@
 mod active_session;
+mod active_session_actions;
 mod login_token;
 mod sent_code;
 mod terms_of_service;
