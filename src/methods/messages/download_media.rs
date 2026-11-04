@@ -20,10 +20,12 @@ use crate::types::FileLocation;
 // https://core.telegram.org/api/files#downloading-files: a limit that divides 1 MB, at offsets that are
 // multiples of it, never crosses a 1 MB boundary.
 const CHUNK: i32 = 512 * 1024;
-const IN_FLIGHT: u64 = 2 << 20;
-// The server throttles Premium downloads less, so they get 8 times the budget.
+// Two chunks per connection, so each connection's next chunk is already asked for while one arrives.
+const IN_FLIGHT: u64 = 4 << 20;
+const CONNECTIONS: usize = 4;
+// The server throttles Premium downloads less, so they get 4 times the budget, on more connections.
 const IN_FLIGHT_PREMIUM: u64 = 16 << 20;
-const MAX_CONNECTIONS: usize = 8;
+const CONNECTIONS_PREMIUM: usize = 8;
 const MAX_MIGRATIONS: usize = 3;
 // Telegram's largest file, 8000 parts of 512 KiB. Reserving the declared size up to this once avoids the copies and
 // the 2x capacity of growing by doubling; a size the server overstates costs at most this, and fails as an Err.
@@ -132,10 +134,8 @@ impl<'a> DownloadMedia<'a> {
         // Held until the download ends; a stream keeps it until it's dropped or finishes.
         let _slot = client.download_slot().await;
         let progress = Progress::new(self.progress, window.len());
-        let budget = if client.is_premium().await.unwrap_or(false) { IN_FLIGHT_PREMIUM } else { IN_FLIGHT };
-        // Without a size the end is only known from a short chunk, so chunks go one at a time.
-        let parts = window.bound.saturating_sub(window.first);
-        let workers = chunk_count(size).map_or(1, |_| workers(parts, CHUNK as u64, budget));
+        let parts = chunk_count(size).map(|_| window.bound.saturating_sub(window.first));
+        let (workers, connections) = limits(parts, client.is_premium().await.unwrap_or(false));
         let mut request = functions::upload::GetFile {
             precise: false,
             // A CDN connection can't carry the takeout wrapper.
@@ -150,7 +150,7 @@ impl<'a> DownloadMedia<'a> {
         let mut dc_id = location.dc_id.unwrap_or_else(|| client.session().dc_id());
         let (mut migrations, mut refreshed) = (0, false);
         let (lease, file) = loop {
-            let lease = client.transfer_sessions(client.media_dc(dc_id)?, workers.min(MAX_CONNECTIONS)).await?;
+            let lease = client.transfer_sessions(client.media_dc(dc_id)?, connections).await?;
             match client.invoke_file_part(&lease.sessions[0], &request).await {
                 Ok(file) => break (lease, file),
                 Err(Error::Rpc(e)) if e.is("FILE_MIGRATE") && migrations < MAX_MIGRATIONS => {
@@ -267,7 +267,7 @@ async fn from_cdn(
     let cdn = async {
         let cdn = Cdn::new(&master.sessions[0], redirect, (client.0.api_id, &client.0.options))?;
         let dc = client.dc(cdn.dc_id)?;
-        let lease = client.cdn_sessions(dc, workers.min(MAX_CONNECTIONS)).await?;
+        let lease = client.cdn_sessions(dc, master.sessions.len()).await?;
         Ok::<_, Error>((cdn, dc, lease))
     }
     .await
@@ -341,6 +341,14 @@ async fn chunks<F: Future<Output = Result<Vec<u8>>>>(
         }
     }
     Ok(total)
+}
+
+/// Workers and connections: chunks in flight within the budget, spread over at most the connection cap.
+fn limits(count: Option<i32>, premium: bool) -> (usize, usize) {
+    let (budget, cap) = if premium { (IN_FLIGHT_PREMIUM, CONNECTIONS_PREMIUM) } else { (IN_FLIGHT, CONNECTIONS) };
+    // Without a size the end is only known from a short chunk, so chunks go one at a time.
+    let workers = count.map_or(1, |c| workers(c, CHUNK as u64, budget));
+    (workers, workers.min(cap))
 }
 
 fn chunk_count(size: Option<i64>) -> Option<i32> {
@@ -519,7 +527,9 @@ mod tests {
 
     use tokio::sync::{mpsc, watch};
 
-    use super::{CHUNK, DownloadMedia, DownloadSource, Master, MediaStream, Sink, Window, chunk, chunk_count, fits};
+    use super::{
+        CHUNK, DownloadMedia, DownloadSource, Master, MediaStream, Sink, Window, chunk, chunk_count, fits, limits,
+    };
     use crate::Client;
     use crate::client::Transmissions;
     use crate::crypto::{aes, sha256};
@@ -564,6 +574,40 @@ mod tests {
         assert!(fits(0, &vec![0; CHUNK as usize + 1], None).is_err());
         assert!(fits(i64::from(CHUNK), b"hi", Some(3 * i64::from(CHUNK))).is_err());
         assert!(fits(i64::from(CHUNK), b"hi", Some(i64::from(CHUNK) + 2)).is_ok());
+    }
+
+    #[test]
+    fn keeps_two_chunks_in_flight_per_connection() {
+        // 50 MiB: 100 chunks.
+        assert_eq!(limits(Some(100), false), (8, 4));
+        assert_eq!(limits(Some(100), true), (32, 8));
+        // Never more workers than chunks, nor more connections than workers.
+        assert_eq!(limits(Some(3), false), (3, 3));
+        assert_eq!(limits(Some(1), true), (1, 1));
+        assert_eq!(limits(None, false), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn download_keeps_two_chunks_per_connection() {
+        let client = Client::offline();
+        let (workers, connections) = limits(Some(100), false);
+        // Two answers per connection: a third request on any of them would fail.
+        let (sessions, mut sent): (Vec<_>, Vec<_>) =
+            (0..connections).map(|_| Session::scripted(vec![file(vec![1]), file(vec![2])])).unzip();
+        let master = Master {
+            client: &client,
+            sessions: &sessions,
+            source: None,
+            location: Mutex::new((get_file(b"old", 0, false).location, 0)),
+            renewing: tokio::sync::Mutex::new(()),
+        };
+        // On this one-thread runtime every worker sends its chunk before any session answers, so each connection
+        // carries two at once.
+        let asks = try_join_all((0..workers).map(|i| master.part(i, i as i64 * i64::from(CHUNK))));
+        assert_eq!(asks.await.unwrap().len(), 8);
+        let per_session: Vec<usize> =
+            sent.iter_mut().map(|rx| std::iter::from_fn(|| rx.try_recv().ok()).count()).collect();
+        assert_eq!(per_session, [2; 4]);
     }
 
     #[tokio::test]

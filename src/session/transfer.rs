@@ -17,7 +17,7 @@ use crate::raw::{RemoteCall, base, functions};
 const IDLE: Duration = Duration::from_secs(15);
 // Telegram's largest part, both ways.
 const MAX_PART: u64 = 512 << 10;
-// Uploads keep two parts in flight per connection (downloads one), so a part can wait behind another.
+// Transfers keep two parts in flight per connection, so a part can wait behind another.
 const PARTS_PER_CONNECTION: u64 = 2;
 // The slowest link a transfer still survives, in bytes per second per connection.
 const MIN_RATE: u64 = 8 << 10;
