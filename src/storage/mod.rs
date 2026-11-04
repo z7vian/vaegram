@@ -8,6 +8,8 @@ pub mod recording;
 pub mod session_string;
 pub mod state;
 mod store;
+#[cfg(feature = "vault")]
+mod vault_storage;
 
 pub use engine::{PeerRecord, Storage, StorageFuture, StoredState};
 pub use file_storage::FileStorage;
@@ -16,6 +18,8 @@ pub use memory_storage::MemoryStorage;
 pub(crate) use store::Recording;
 pub(crate) use store::Store;
 pub use store::{FileStore, MemoryStore, SessionStore};
+#[cfg(feature = "vault")]
+pub use vault_storage::VaultStorage;
 
 use std::fs;
 use std::io::{self, Write};
