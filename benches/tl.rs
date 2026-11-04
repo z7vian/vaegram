@@ -8,15 +8,18 @@ mod timing;
 use std::hint::black_box;
 use std::io::{Read, Write};
 
-use timing::bench;
-use vaegram::connection::{Connection, Options};
-use vaegram::crypto::mtproto;
+use timing::{bench, bench_bytes, bench_bytes_counted};
+use vaegram::connection::{Connection, Framing, Options, RecvBuf, Transport};
+use vaegram::crypto::{aes, mtproto};
 use vaegram::raw::{Deserializable, Identifiable, Serializable, base, functions, types};
 use vaegram::session::internals::data_center::Dc;
 use vaegram::storage::{SessionData, session_string};
 
 const VECTOR: u32 = 0x1cb5c415;
 const TEXT: &str = "Hello there, this is a fairly ordinary chat message.";
+// The payload sizes Go's MTProto benchmarks use, so the two report comparable rows.
+const SIZES: [usize; 6] = [16, 128, 1 << 10, 8 << 10, 64 << 10, 512 << 10];
+const BIG: usize = 512 << 10;
 
 fn message_bytes(id: i32, out: &mut Vec<u8>) {
     types::Message::CONSTRUCTOR_ID.serialize(out);
@@ -181,8 +184,9 @@ fn main() {
     let auth_key_id = [1u8; 8];
     let session_id = [2u8; 8];
     let mut packet = Vec::new();
-    for (name, body) in [("ping", ping.to_bytes()), ("512K part", part_bytes)] {
-        bench(&format!("mtproto seal {name}"), || {
+    for size in SIZES {
+        let body = vec![0xab; size];
+        bench_bytes(&format!("mtproto seal {size} B"), size, || {
             packet.clear();
             packet.resize(mtproto::HEADER, 0);
             packet.extend_from_slice(black_box(&body));
@@ -191,15 +195,32 @@ fn main() {
         });
         // Each round copies the ciphertext back in, since opening decrypts it in place.
         let sealed = seal::seal(&auth_key, &auth_key_id, &session_id, (1 << 32) + 1, 1, &body);
-        bench(&format!("mtproto open {name}"), || {
+        bench_bytes(&format!("mtproto open {size} B"), size, || {
             packet.clear();
             packet.extend_from_slice(black_box(&sealed));
             black_box(mtproto::open(&mut packet, &auth_key, &auth_key_id, &session_id).unwrap());
         });
     }
 
-    for size in [256, 64 << 10] {
+    let (key, ige_iv) = ([3u8; 32], [4u8; 32]);
+    let mut data = vec![0x5a; BIG];
+    bench_bytes("ige256_decrypt 512 KiB", BIG, || {
+        aes::ige256_decrypt(black_box(&mut data), &key, &ige_iv).unwrap();
+    });
+    let (mut ctr_iv, mut used) = ([5u8; 16], 0u8);
+    bench_bytes("ctr256 512 KiB", BIG, || {
+        aes::ctr256(black_box(&mut data), &key, &mut ctr_iv, &mut used);
+    });
+
+    for transport in [Transport::Abridged, Transport::Intermediate, Transport::PaddedIntermediate, Transport::Full] {
+        framing(transport, &mut buf);
+    }
+
+    for size in [256, 64 << 10, BIG] {
         recv_loopback(size);
+    }
+    for size in [64 << 10, BIG] {
+        recv_loopback_obfuscated(size);
     }
 
     let mut session = SessionData::new(2, auth_key);
@@ -213,25 +234,95 @@ fn main() {
     });
 }
 
-// A loopback server streams `size`-byte frames; each op reads one through the real Connection,
+// Framing alone, without a socket: `frame` builds the header around a payload, `decode` takes it back off a buffer
+// that the frame was just copied into, as a socket read would.
+fn framing(transport: Transport, buf: &mut Vec<u8>) {
+    for size in SIZES {
+        let payload = vec![0x5a; size];
+        let mut sender = Framing::new(transport);
+        bench_bytes(&format!("{transport:?} frame {size} B"), size, || {
+            buf.clear();
+            buf.resize(Framing::ROOM, 0);
+            buf.extend_from_slice(black_box(&payload));
+            black_box(sender.frame(buf));
+        });
+        buf.clear();
+        buf.resize(Framing::ROOM, 0);
+        buf.extend_from_slice(&payload);
+        let start = Framing::new(transport).frame(buf);
+        let frame = buf[start..].to_vec();
+        let mut recv = RecvBuf::default();
+        bench_bytes(&format!("{transport:?} decode {size} B"), size, || {
+            // A fresh receiver each round, so the full transport's sequence number matches the one frame.
+            let mut receiver = Framing::new(transport);
+            recv.extend_from_slice(black_box(&frame));
+            black_box(receiver.decode(&mut recv).unwrap().unwrap());
+        });
+    }
+}
+
+// A loopback server streams `size`-byte intermediate frames; each op reads one through the real Connection,
 // so syscalls and buffering are part of the number.
 fn recv_loopback(size: usize) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-    let mut frames = Vec::new();
-    while frames.len() < 1 << 20 {
-        frames.extend_from_slice(&(size as u32).to_le_bytes());
-        frames.resize(frames.len() + size, 0x5a);
-    }
+    let frames = frames(size, 1 << 20);
     std::thread::spawn(move || {
         let (mut s, _) = listener.accept().unwrap();
         s.read_exact(&mut [0; 4]).unwrap();
         while s.write_all(&frames).is_ok() {}
     });
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-    let dc = Dc { id: 2, addr, test: false };
-    let mut conn = rt.block_on(Connection::connect(&dc, &Options::default())).unwrap();
-    bench(&format!("recv loopback {size} B"), || {
+    let (rt, mut conn) = connect(addr, false);
+    bench_bytes(&format!("recv loopback {size} B"), size, || {
         black_box(rt.block_on(conn.recv()).unwrap());
     });
+}
+
+// The same over an obfuscated connection. The keys come from the client's random header, so the server encrypts
+// one long stream as soon as it has the header, before it sends anything, and the timed reads only replay it:
+// the client's decryption is measured and the server's encryption isn't.
+fn recv_loopback_obfuscated(size: usize) {
+    const STREAM: usize = 64 << 20;
+    const WARM_UP: usize = 4;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut stream = frames(size, STREAM);
+    let count = stream.len() / (4 + size);
+    std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        // The client decrypts with the reversed key and iv bytes of its 64-byte header.
+        let mut header = [0u8; 64];
+        s.read_exact(&mut header).unwrap();
+        let mut reversed = [0u8; 48];
+        reversed.copy_from_slice(&header[8..56]);
+        reversed.reverse();
+        let key: [u8; 32] = reversed[..32].try_into().unwrap();
+        let (mut iv, mut used): ([u8; 16], u8) = (reversed[32..].try_into().unwrap(), 0);
+        aes::ctr256(&mut stream, &key, &mut iv, &mut used);
+        s.write_all(&stream).unwrap();
+        // Held open until the client is done, so it never sees the end of the stream early.
+        let _ = s.read(&mut [0; 1]);
+    });
+    let (rt, mut conn) = connect(addr, true);
+    bench_bytes_counted(&format!("recv loopback obfuscated {size} B"), size, WARM_UP, count - WARM_UP, || {
+        black_box(rt.block_on(conn.recv()).unwrap());
+    });
+}
+
+/// Back-to-back intermediate frames of `size` bytes, at least `total` bytes of them.
+fn frames(size: usize, total: usize) -> Vec<u8> {
+    let mut frames = Vec::with_capacity(total + 4 + size);
+    while frames.len() < total {
+        frames.extend_from_slice(&(size as u32).to_le_bytes());
+        frames.resize(frames.len() + size, 0x5a);
+    }
+    frames
+}
+
+fn connect(addr: std::net::SocketAddr, obfuscated: bool) -> (tokio::runtime::Runtime, Connection) {
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let dc = Dc { id: 2, addr, test: false };
+    let options = Options { obfuscated, ..Options::default() };
+    let conn = rt.block_on(Connection::connect(&dc, &options)).unwrap();
+    (rt, conn)
 }
