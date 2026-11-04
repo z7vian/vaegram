@@ -1,9 +1,12 @@
 mod craft_gift_result;
 mod gift;
 mod gift_actions;
+mod gift_auction;
 mod gift_auction_state;
+mod gift_background;
 mod gift_collection;
 mod gift_info;
+mod gift_resale_parameters;
 mod gift_upgrade_preview;
 mod gift_upgrade_variants;
 mod invoice_ref;
@@ -11,16 +14,21 @@ mod owned_gift;
 mod payment_form;
 mod resale_gift;
 mod star_payment_option;
+mod upgraded_gift_attribute_rarity;
+mod upgraded_gift_original_details;
 mod upgraded_gift_value_info;
 
 pub use craft_gift_result::CraftGiftResult;
 pub use gift::{Gift, UniqueGift, UniqueGiftAttribute, UniqueGiftBackdrop};
+pub use gift_auction::GiftAuction;
 pub use gift_auction_state::{
     ActiveGiftAuction, FinishedGiftAuction, GiftAuctionBid, GiftAuctionBidLevel, GiftAuctionRound, GiftAuctionState,
     GiftAuctionStatus,
 };
+pub use gift_background::GiftBackground;
 pub use gift_collection::GiftCollection;
 pub use gift_info::{GiftInfo, UniqueGiftInfo};
+pub use gift_resale_parameters::GiftResaleParameters;
 pub use gift_upgrade_preview::{GiftUpgradePreview, GiftUpgradePrice};
 pub use gift_upgrade_variants::GiftUpgradeVariants;
 pub use invoice_ref::InvoiceRef;
@@ -28,4 +36,6 @@ pub use owned_gift::{OwnedGift, OwnedGiftRegular, OwnedGiftUnique, OwnedGifts};
 pub use payment_form::PaymentForm;
 pub use resale_gift::ResaleGift;
 pub use star_payment_option::StarPaymentOption;
+pub use upgraded_gift_attribute_rarity::UpgradedGiftAttributeRarity;
+pub use upgraded_gift_original_details::UpgradedGiftOriginalDetails;
 pub use upgraded_gift_value_info::UpgradedGiftValueInfo;
