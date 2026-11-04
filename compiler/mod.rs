@@ -76,8 +76,9 @@ fn split_ns(name: &str) -> (&str, &str) {
 }
 
 // Types whose every value is a credential: bot tokens, SRP proofs, payment credentials, Passport data and
-// secrets, wallet recovery phrases, email login tokens and call relay passwords.
-const SECRET_TYPES: [&str; 14] = [
+// secrets, wallet recovery phrases, email login tokens, call relay passwords and order contact details and
+// addresses.
+const SECRET_TYPES: [&str; 16] = [
     "bots.ExportedBotToken",
     "InputCheckPasswordSRP",
     "InputPaymentCredentials",
@@ -92,6 +93,8 @@ const SECRET_TYPES: [&str; 14] = [
     "wallet.EncryptedSecretPhrasePart",
     "EmailVerification",
     "PhoneConnection",
+    "PaymentRequestedInfo",
+    "PostAddress",
 ];
 // Fields that are credentials wherever they appear.
 const SECRET_FIELDS: [&str; 4] = ["tmp_password", "phone_code_hash", "match_code", "match_codes"];
