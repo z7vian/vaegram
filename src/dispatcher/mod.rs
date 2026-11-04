@@ -5,10 +5,11 @@ pub(crate) mod router;
 mod tasks;
 mod tracker;
 
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
 pub(crate) use entities::Entities;
@@ -22,9 +23,17 @@ use crate::errors::Result;
 use crate::raw::{base, types};
 use crate::session::{Incoming, UpdatesRx};
 use crate::storage::UpdateState;
-use crate::utils::get_channel_id;
+use crate::utils::{channel_id_of, get_channel_id};
 
 const SAVE_EVERY: Duration = Duration::from_secs(10);
+
+/// A `recover_gaps` call for the running dispatcher to carry out.
+pub(crate) struct Recover {
+    /// `None` for every box; otherwise 0 for the common box and `-100…` ids for channels.
+    pub(crate) chats: Option<Vec<i64>>,
+    /// Messages, then other updates, that came from the recovery.
+    pub(crate) reply: oneshot::Sender<(usize, usize)>,
+}
 
 pub(crate) struct Dispatcher {
     client: Client,
@@ -35,6 +44,8 @@ pub(crate) struct Dispatcher {
     generation: u64,
     account: u64,
     tasks: Tasks,
+    // Messages and other updates the differences have brought in, counted by `difference.rs`.
+    recovered: (usize, usize),
 }
 
 impl Dispatcher {
@@ -57,7 +68,17 @@ impl Dispatcher {
         tasks.on_error = router.on_error.clone();
         tasks.events = client.0.events.clone();
         let saved = Default::default();
-        Dispatcher { client, tracker, saved_at: Instant::now(), saved, router, generation, account, tasks }
+        Dispatcher {
+            client,
+            tracker,
+            saved_at: Instant::now(),
+            saved,
+            router,
+            generation,
+            account,
+            tasks,
+            recovered: (0, 0),
+        }
     }
 
     fn same_account(&self) -> bool {
@@ -68,6 +89,8 @@ impl Dispatcher {
     pub(crate) async fn run(&mut self, updates: &mut UpdatesRx) -> bool {
         let mut stop = self.client.0.stop.subscribe();
         self.client.0.handlers.listeners.open();
+        let (requests, mut recoveries) = mpsc::unbounded_channel();
+        *self.client.0.recover.lock().unwrap_or_else(PoisonError::into_inner) = Some(requests);
         self.resolve().await;
         loop {
             for (update, entities) in std::mem::take(&mut self.tracker.ready) {
@@ -101,6 +124,10 @@ impl Dispatcher {
                     }
                     return true;
                 }
+                Some(request) = recoveries.recv() => {
+                    self.recover(request).await;
+                    continue;
+                }
                 next = next => next,
             };
             match next {
@@ -110,6 +137,31 @@ impl Dispatcher {
             }
             self.resolve().await;
         }
+    }
+
+    /// Marks what was asked for as due and resolves it now; the updates it finds are dispatched on the next turn.
+    async fn recover(&mut self, request: Recover) {
+        let t = &mut self.tracker;
+        match request.chats {
+            None => {
+                t.mark(Key::Pts);
+                let channels: Vec<i64> = t.state.channels.keys().copied().collect();
+                channels.into_iter().for_each(|id| t.mark(Key::Channel(id)));
+            }
+            Some(chats) => {
+                for chat in chats {
+                    if chat == 0 {
+                        t.mark(Key::Pts);
+                    } else if t.state.channels.contains_key(&channel_id_of(chat)) {
+                        t.mark(Key::Channel(channel_id_of(chat)));
+                    }
+                }
+            }
+        }
+        let before = self.recovered;
+        self.resolve().await;
+        // The caller may have stopped waiting.
+        let _ = request.reply.send((self.recovered.0 - before.0, self.recovered.1 - before.1));
     }
 
     fn process(&mut self, incoming: Incoming) {
@@ -179,6 +231,7 @@ impl Dispatcher {
 impl Drop for Dispatcher {
     fn drop(&mut self) {
         self.client.0.handlers.listeners.close();
+        *self.client.0.recover.lock().unwrap_or_else(PoisonError::into_inner) = None;
         let Ok(mut state) = self.client.0.state.lock() else { return };
         if self.same_account() {
             *state = Some(std::mem::take(&mut self.tracker.state));
@@ -487,6 +540,48 @@ mod tests {
         d.tracker.state.channels.insert(9, pts);
         d.tracker.mark(Key::Channel(9));
         (d, events)
+    }
+
+    #[tokio::test]
+    async fn recovery_counts_messages_then_other_updates() {
+        let bare = || base::Message::Message(Box::new(Message::bare(1, get_peer(7), 0)));
+        let difference = types::updates::Difference {
+            new_messages: vec![bare(), bare()],
+            new_encrypted_messages: Vec::new(),
+            other_updates: vec![new_message(2)],
+            chats: Vec::new(),
+            users: Vec::new(),
+            state: base::updates::State::State(Box::new(types::updates::State { pts: 2, ..state() })),
+        };
+        let difference = base::updates::Difference::Difference(Box::new(difference));
+        let (client, _sent) = Client::scripted(vec![Ok(difference.to_bytes())]);
+        let mut d = Dispatcher::new(client, &state());
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        d.recover(super::Recover { chats: None, reply }).await;
+        assert_eq!(answer.await.unwrap(), (2, 1));
+        // The updates wait for the next turn of `run` to be dispatched.
+        assert_eq!(d.tracker.ready.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn recovery_only_asks_for_the_named_boxes() {
+        let page = types::updates::ChannelDifference {
+            r#final: true,
+            pts: 5,
+            timeout: None,
+            new_messages: vec![base::Message::Message(Box::new(Message::bare(42, get_peer(get_channel_id(9)), 0)))],
+            other_updates: Vec::new(),
+            chats: Vec::new(),
+            users: Vec::new(),
+        };
+        let page = base::updates::ChannelDifference::ChannelDifference(Box::new(page));
+        // One reply only: asking for the common box or the unknown channel would fail the test.
+        let (mut d, _events) = in_channel(vec![Ok(page.to_bytes())], 1);
+        d.tracker.due.clear();
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        d.recover(super::Recover { chats: Some(vec![get_channel_id(9), get_channel_id(77)]), reply }).await;
+        assert_eq!(answer.await.unwrap(), (1, 0));
+        assert_eq!(d.tracker.state.channels[&9], 5);
     }
 
     #[tokio::test]
