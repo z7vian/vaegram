@@ -21,6 +21,7 @@ mod star_payment_option;
 mod upgraded_gift_attribute_rarity;
 mod upgraded_gift_original_details;
 mod upgraded_gift_value_info;
+mod validated_order_info;
 
 pub use craft_gift_result::CraftGiftResult;
 pub use gift::{Gift, UniqueGift, UniqueGiftAttribute, UniqueGiftBackdrop};
@@ -47,3 +48,4 @@ pub use star_payment_option::StarPaymentOption;
 pub use upgraded_gift_attribute_rarity::UpgradedGiftAttributeRarity;
 pub use upgraded_gift_original_details::UpgradedGiftOriginalDetails;
 pub use upgraded_gift_value_info::UpgradedGiftValueInfo;
+pub use validated_order_info::ValidatedOrderInfo;
