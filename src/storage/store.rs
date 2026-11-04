@@ -130,6 +130,14 @@ impl Store {
         self.call(move |e| async move { e.get_peer_by_id(id).await }).await
     }
 
+    pub(crate) async fn get_peer_by_username(&self, username: String) -> io::Result<Option<PeerRecord>> {
+        self.call(move |e| async move { e.get_peer_by_username(&username).await }).await
+    }
+
+    pub(crate) async fn get_peer_by_phone_number(&self, phone_number: String) -> io::Result<Option<PeerRecord>> {
+        self.call(move |e| async move { e.get_peer_by_phone_number(&phone_number).await }).await
+    }
+
     pub(crate) async fn save_session(&self, session: SessionData) -> io::Result<()> {
         let pending = self.pending.clone();
         self.call(move |e| async move {
