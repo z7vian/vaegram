@@ -229,6 +229,113 @@ async fn invoke_part_on<R: RemoteCall>(session: &Session, request: &R, cdn: bool
     }
 }
 
+/// The parts in flight that one transfer's workers share. A FLOOD_WAIT pauses every worker until it ends and
+/// halves the window (never below `min`); a window's worth of clean parts in a row grows it by one (never above
+/// `max`). Parts that sleep their own floods keep sending into the limit and draw one flood each.
+pub(crate) struct Pace {
+    state: Mutex<PaceState>,
+    changed: tokio::sync::Notify,
+}
+
+struct PaceState {
+    resume_at: Option<tokio::time::Instant>,
+    size: usize,
+    min: usize,
+    max: usize,
+    clean: usize,
+    in_flight: usize,
+}
+
+struct PaceSlot<'a>(&'a Pace);
+
+impl Pace {
+    pub(crate) fn new(min: usize, max: usize) -> Pace {
+        let state = PaceState { resume_at: None, size: max, min: min.min(max), max, clean: 0, in_flight: 0 };
+        Pace { state: Mutex::new(state), changed: tokio::sync::Notify::new() }
+    }
+
+    async fn acquire(&self) -> PaceSlot<'_> {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let resume_at = {
+                let mut s = self.state.lock().unwrap();
+                match s.resume_at {
+                    Some(at) if at > tokio::time::Instant::now() => Some(at),
+                    _ => {
+                        s.resume_at = None;
+                        if s.in_flight < s.size {
+                            s.in_flight += 1;
+                            return PaceSlot(self);
+                        }
+                        None
+                    }
+                }
+            };
+            match resume_at {
+                Some(at) => tokio::time::sleep_until(at).await,
+                None => changed.await,
+            }
+        }
+    }
+
+    fn flood(&self, wait: Duration) {
+        let mut s = self.state.lock().unwrap();
+        let at = tokio::time::Instant::now() + wait;
+        s.resume_at = Some(s.resume_at.map_or(at, |r| r.max(at)));
+        s.size = (s.size / 2).max(s.min);
+        s.clean = 0;
+    }
+
+    fn clean(&self) {
+        let mut s = self.state.lock().unwrap();
+        s.clean += 1;
+        if s.clean >= s.size && s.size < s.max {
+            (s.size, s.clean) = (s.size + 1, 0);
+            drop(s);
+            self.changed.notify_waiters();
+        }
+    }
+}
+
+impl Drop for PaceSlot<'_> {
+    fn drop(&mut self) {
+        self.0.state.lock().unwrap().in_flight -= 1;
+        self.0.changed.notify_waiters();
+    }
+}
+
+/// `invoke_part` inside a shared `Pace`: the retry policy still decides whether a failure is retried and for how long,
+/// but a FLOOD_WAIT it chooses to wait out pauses the whole transfer instead of this part alone.
+pub(crate) async fn invoke_paced<R: RemoteCall>(session: &Session, request: &R, pace: &Pace) -> Result<R::Return> {
+    let timeout = PART_TIMEOUT.max(session.options().request_timeout);
+    let (mut timeouts, mut retries, mut slept) = (0, 0u32, Duration::ZERO);
+    loop {
+        // Held until a flood is registered, so no other part slips a request in between.
+        let slot = pace.acquire().await;
+        let result = session.invoke_with_timeout(request, timeout).await;
+        let retry = result.as_ref().err().map(|e| session.should_retry(R::NAME, e, retries + 1, slept, None));
+        match (&result, retry) {
+            (Err(Error::Rpc(e)), Some(ControlFlow::Continue(wait))) if e.flood_wait().is_some() => {
+                (retries, slept) = (retries + 1, slept + wait);
+                pace.flood(wait);
+            }
+            (_, Some(ControlFlow::Continue(wait))) => {
+                (retries, slept) = (retries + 1, slept + wait);
+                drop(slot);
+                tokio::time::sleep(wait).await;
+            }
+            (Err(Error::Timeout), _) if timeouts + 1 < MAX_TIMEOUTS => timeouts += 1,
+            (Ok(_), _) => {
+                pace.clean();
+                return result;
+            }
+            _ => return result,
+        }
+    }
+}
+
 pub(crate) fn workers(parts: i32, part_size: u64, budget: u64) -> usize {
     ((budget / part_size) as usize).clamp(1, parts.max(1) as usize)
 }
@@ -288,8 +395,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        Auth, MAX_CDN_FLOOD_WAIT, PART_TIMEOUT, Progress, Session, TransferPool, invoke_cdn_part, invoke_part, take,
-        try_join_all, workers,
+        Auth, MAX_CDN_FLOOD_WAIT, PART_TIMEOUT, Pace, Progress, Session, TransferPool, invoke_cdn_part, invoke_paced,
+        invoke_part, take, try_join_all, workers,
     };
     use crate::Client;
     use crate::connection::{Options, Transport};
@@ -457,5 +564,70 @@ mod tests {
 
         let failing = [Err(Error::Timeout), Ok(1)].map(|r| async move { r });
         assert!(matches!(try_join_all(failing.into_iter()).await, Err(Error::Timeout)));
+    }
+
+    // How many slots `pace` hands out right now, without waiting.
+    async fn free(pace: &Pace) -> usize {
+        let mut held = Vec::new();
+        while let Ok(slot) = tokio::time::timeout(Duration::ZERO, pace.acquire()).await {
+            held.push(slot);
+        }
+        held.len()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_flood_pauses_every_part_and_halves_the_window() {
+        let pace = Pace::new(8, 16);
+        assert_eq!(free(&pace).await, 16);
+        pace.flood(Duration::from_secs(2));
+        pace.flood(Duration::from_secs(1));
+        assert_eq!(free(&pace).await, 0);
+        tokio::time::advance(Duration::from_millis(1999)).await;
+        assert_eq!(free(&pace).await, 0);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(free(&pace).await, 8);
+        pace.flood(Duration::ZERO);
+        assert_eq!(free(&pace).await, 8);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_window_of_clean_parts_grows_it_by_one_up_to_the_max() {
+        let pace = Pace::new(8, 10);
+        pace.flood(Duration::ZERO);
+        (0..7).for_each(|_| pace.clean());
+        assert_eq!(free(&pace).await, 8);
+        pace.clean();
+        assert_eq!(free(&pace).await, 9);
+        (0..9 + 10 + 30).for_each(|_| pace.clean());
+        assert_eq!(free(&pace).await, 10);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_waiting_part_starts_when_one_in_flight_ends() {
+        let pace = Pace::new(1, 1);
+        let first = pace.acquire().await;
+        let second = pace.acquire();
+        tokio::pin!(second);
+        assert!(tokio::time::timeout(Duration::from_secs(60), second.as_mut()).await.is_err());
+        drop(first);
+        assert!(tokio::time::timeout(Duration::ZERO, second).await.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_flood_wait_pauses_every_upload_worker() {
+        let flood = Err(Error::Rpc(RpcError::new(420, "FLOOD_WAIT_2")));
+        let saved = || Ok(true.to_bytes());
+        let (session, mut sent) = Session::scripted(vec![flood, saved(), saved(), saved()]);
+        let (pace, part) =
+            (Pace::new(1, 2), functions::upload::SaveFilePart { file_id: 1, file_part: 0, bytes: vec![1] });
+        let (session, pace, part, start) = (&session, &pace, &part, tokio::time::Instant::now());
+        let timed = || async move { (invoke_paced(session, part, pace).await.is_ok(), start.elapsed()) };
+        let (flooded, in_flight, waiting) = tokio::join!(timed(), timed(), timed());
+
+        // The part already on the wire finishes; the flooded one and the one waiting for a slot both sit out the 2 s.
+        let wait = Duration::from_secs(2);
+        assert!(flooded.0 && in_flight.0 && waiting.0);
+        assert!(in_flight.1 < wait && flooded.1 >= wait && waiting.1 >= wait, "{flooded:?} {in_flight:?} {waiting:?}");
+        assert_eq!(std::iter::from_fn(|| sent.try_recv().ok()).count(), 4);
     }
 }
