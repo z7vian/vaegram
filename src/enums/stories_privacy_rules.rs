@@ -40,6 +40,25 @@ impl StoriesPrivacyRules {
         }
         rules
     }
+
+    /// The audience a story's privacy rules describe, or `None` when they are not one `rules` produces.
+    pub(crate) fn from_rules(rules: &[PrivacyRule]) -> Option<StoriesPrivacyRules> {
+        let except = |rest: &[PrivacyRule]| match rest {
+            [] => Some(Vec::new()),
+            [PrivacyRule::DisallowUsers(users)] => Some(users.clone()),
+            _ => None,
+        };
+        match rules {
+            [PrivacyRule::AllowAll, rest @ ..] => Some(StoriesPrivacyRules::Public { except: except(rest)? }),
+            [PrivacyRule::AllowContacts, rest @ ..] => Some(StoriesPrivacyRules::Contacts { except: except(rest)? }),
+            [PrivacyRule::AllowCloseFriends] => Some(StoriesPrivacyRules::CloseFriends),
+            [PrivacyRule::AllowUsers(users)] => Some(StoriesPrivacyRules::SelectedUsers(users.clone())),
+            [PrivacyRule::AllowUsers(users), PrivacyRule::AllowChatMembers(chats)] => {
+                Some(StoriesPrivacyRules::SelectedUsers(users.iter().chain(chats).copied().collect()))
+            }
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -59,5 +78,31 @@ mod tests {
             StoriesPrivacyRules::SelectedUsers(vec![6, -42, -1_000_000_001_234]).rules(),
             [PrivacyRule::AllowUsers(vec![6]), PrivacyRule::AllowChatMembers(vec![-42, -1_000_000_001_234])]
         );
+    }
+
+    #[test]
+    fn rules_parse_back() {
+        for audience in [
+            StoriesPrivacyRules::default(),
+            StoriesPrivacyRules::Public { except: vec![3, 4] },
+            StoriesPrivacyRules::Contacts { except: Vec::new() },
+            StoriesPrivacyRules::Contacts { except: vec![5] },
+            StoriesPrivacyRules::CloseFriends,
+            StoriesPrivacyRules::SelectedUsers(vec![6, 7]),
+            StoriesPrivacyRules::SelectedUsers(vec![6, -42, -1_000_000_001_234]),
+        ] {
+            assert_eq!(StoriesPrivacyRules::from_rules(&audience.rules()), Some(audience));
+        }
+    }
+
+    #[test]
+    fn unrepresentable_rules_give_none() {
+        assert_eq!(StoriesPrivacyRules::from_rules(&[]), None);
+        assert_eq!(StoriesPrivacyRules::from_rules(&[PrivacyRule::DisallowAll]), None);
+        assert_eq!(StoriesPrivacyRules::from_rules(&[PrivacyRule::AllowPremium]), None);
+        let rules = [PrivacyRule::AllowAll, PrivacyRule::AllowContacts];
+        assert_eq!(StoriesPrivacyRules::from_rules(&rules), None);
+        let rules = [PrivacyRule::AllowCloseFriends, PrivacyRule::DisallowUsers(vec![1])];
+        assert_eq!(StoriesPrivacyRules::from_rules(&rules), None);
     }
 }
