@@ -8,7 +8,7 @@ use crate::crypto::random;
 use crate::errors::{Error, Result};
 use crate::raw::{base, functions, types};
 use crate::session::Session;
-use crate::session::transfer::{Progress, Report, invoke_part, take, try_join_all, workers};
+use crate::session::transfer::{Pace, Progress, Report, invoke_paced, take, try_join_all, workers};
 use crate::types::Upload;
 
 // https://core.telegram.org/api/files#uploading-files
@@ -16,7 +16,9 @@ const PART_SIZE: u64 = 512 * 1024;
 const BIG_FILE_SIZE: u64 = 10 * 1024 * 1024;
 const MAX_PARTS: u64 = 4000;
 const MAX_PARTS_PREMIUM: u64 = 8000;
+// Parts in flight: up to 8 MB while Telegram takes them, back to 4 MB after a FLOOD_WAIT (see `Pace`).
 const IN_FLIGHT: u64 = 4 << 20;
+const IN_FLIGHT_MAX: u64 = 8 << 20;
 const CONNECTIONS: usize = 4;
 // The server throttles Premium uploads less, so more connections stay busy.
 const CONNECTIONS_PREMIUM: usize = 8;
@@ -76,8 +78,10 @@ impl<'a> SaveFile<'a> {
         let lease = self.client.transfer_sessions(home, connections).await?;
         let upload = Parts { source, size, count: parts, big: size > BIG_FILE_SIZE, id: i64::from_le_bytes(random()) };
         let (next, progress) = (AtomicI32::new(0), Progress::new(self.progress, size));
-        let sessions = &lease.sessions;
-        try_join_all((0..workers).map(|i| upload.send(&sessions[i % sessions.len()], &next, &progress))).await?;
+        let pace = Pace::new((IN_FLIGHT / PART_SIZE) as usize, workers);
+        let (sessions, pace) = (&lease.sessions, &pace);
+        let send = |i: usize| upload.send(&sessions[i % sessions.len()], &next, &progress, pace);
+        try_join_all((0..workers).map(send)).await?;
         Ok(upload.input_file(name))
     }
 }
@@ -91,7 +95,7 @@ impl Client {
             premium => premium.unwrap_or(false),
         };
         let parts = part_count(size, premium)?;
-        let workers = workers(parts, PART_SIZE, IN_FLIGHT);
+        let workers = workers(parts, PART_SIZE, IN_FLIGHT_MAX);
         Ok((parts, workers, workers.min(if premium { CONNECTIONS_PREMIUM } else { CONNECTIONS })))
     }
 }
@@ -151,18 +155,18 @@ impl Parts<'_> {
         Ok(Some(part))
     }
 
-    async fn send(&self, session: &Session, next: &AtomicI32, progress: &Progress<'_>) -> Result<()> {
+    async fn send(&self, session: &Session, next: &AtomicI32, progress: &Progress<'_>, pace: &Pace) -> Result<()> {
         let (file_id, mut bytes) = (self.id, Vec::with_capacity(PART_SIZE.min(self.size) as usize));
         while let Some(file_part) = self.read(next, &mut bytes).await? {
             let saved = if self.big {
                 let total = self.count;
                 let request = functions::upload::SaveBigFilePart { file_id, file_part, file_total_parts: total, bytes };
-                let saved = invoke_part(session, &request).await;
+                let saved = invoke_paced(session, &request, pace).await;
                 bytes = request.bytes;
                 saved
             } else {
                 let request = functions::upload::SaveFilePart { file_id, file_part, bytes };
-                let saved = invoke_part(session, &request).await;
+                let saved = invoke_paced(session, &request, pace).await;
                 bytes = request.bytes;
                 saved
             };
@@ -219,7 +223,7 @@ mod tests {
         let big = MAX_PARTS * PART_SIZE + 1;
 
         assert_eq!(client.upload_limits(3 << 20).await.unwrap(), (6, 6, 4));
-        assert!(matches!(client.upload_limits(big).await, Ok((4001, 8, 8))));
+        assert!(matches!(client.upload_limits(big).await, Ok((4001, 16, 8))));
         assert_eq!(lookups(), 2);
         assert_eq!(client.upload_limits(3 << 20).await.unwrap(), (6, 6, 6));
         assert_eq!(lookups(), 0);
