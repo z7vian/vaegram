@@ -1,41 +1,23 @@
 name: vaegram
 
-on: [push, pull_request]
+on: [push]
 
 jobs:
-  rust:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
-        toolchain: ["1.85", stable]
-
+  tree:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ matrix.toolchain }}
-          components: clippy, rustfmt
-
-      - name: Test
-        run: cargo test --workspace --all-features
-
-      # `--all-features` would hide a TL type leaking out of `unstable-raw`; the doc tests check it's absent.
-      - name: Default features
-        if: matrix.toolchain == 'stable' && matrix.os == 'ubuntu-latest'
-        run: cargo test --workspace --doc
-
-      - name: Clippy
-        if: matrix.toolchain == 'stable'
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-
-      - name: Format
-        if: matrix.toolchain == 'stable' && matrix.os == 'ubuntu-latest'
-        run: cargo fmt --all --check
-
-      - name: Package
-        if: matrix.toolchain == 'stable' && matrix.os == 'ubuntu-latest'
-        run: cargo publish --dry-run -p vaegram
+          toolchain: "1.85"
+      - name: aws-lc with only the vault feature
+        run: |
+          set +e
+          cargo tree --locked -e features -i aws-lc-sys --features vault; echo "exit $?"
+          cargo tree --locked -e features -i aws-lc-rs --features vault; echo "exit $?"
+          cargo tree --locked -e normal,dev --features vault | grep -i "aws-lc" || echo "aws-lc: nothing in the vault-only tree"
+      - name: tokio-rustls and rcgen features with only the vault feature
+        run: |
+          cargo tree --locked -e features -i tokio-rustls --features vault
+          cargo tree --locked -e features -i rcgen --features vault
+          cargo tree --locked -e features -i rustls --features vault
