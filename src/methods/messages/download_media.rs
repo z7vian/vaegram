@@ -14,7 +14,7 @@ use crate::errors::{Error, Result};
 use crate::raw::{base, functions, types};
 use crate::session::Session;
 use crate::session::cdn::Cdn;
-use crate::session::transfer::{Progress, Report, take, try_join_all, workers};
+use crate::session::transfer::{Progress, Report, per_connection, take, try_join_all, workers};
 use crate::types::FileLocation;
 
 // https://core.telegram.org/api/files#downloading-files: a limit that divides 1 MB, at offsets that are
@@ -151,7 +151,8 @@ impl<'a> DownloadMedia<'a> {
         let (mut migrations, mut refreshed) = (0, false);
         let (lease, file) = loop {
             let lease = client.transfer_sessions(client.media_dc(dc_id)?, connections).await?;
-            match client.invoke_file_part(&lease.sessions[0], &request).await {
+            // The first chunk goes alone, before any worker starts.
+            match client.invoke_file_part(&lease.sessions[0], &request, 1).await {
                 Ok(file) => break (lease, file),
                 Err(Error::Rpc(e)) if e.is("FILE_MIGRATE") && migrations < MAX_MIGRATIONS => {
                     dc_id = e.migrate_dc().ok_or(Error::Unexpected("FILE_MIGRATE without a DC number"))?;
@@ -169,6 +170,7 @@ impl<'a> DownloadMedia<'a> {
         let master = Master {
             client,
             sessions: &lease.sessions,
+            in_flight: per_connection(workers, lease.sessions.len()),
             source: self.source,
             location: Mutex::new((request.location, 0)),
             renewing: tokio::sync::Mutex::new(()),
@@ -190,6 +192,8 @@ impl<'a> DownloadMedia<'a> {
 struct Master<'a> {
     client: &'a Client,
     sessions: &'a [Session],
+    // Chunks each connection carries at most, which sets how long one may take.
+    in_flight: usize,
     source: Option<DownloadSource>,
     location: Mutex<(base::InputFileLocation, usize)>,
     renewing: tokio::sync::Mutex<()>,
@@ -203,7 +207,7 @@ impl Master<'_> {
             let (location, seen) = self.location.lock().unwrap().clone();
             let request =
                 functions::upload::GetFile { precise: false, cdn_supported: false, location, offset, limit: CHUNK };
-            match self.client.invoke_file_part(session, &request).await {
+            match self.client.invoke_file_part(session, &request, self.in_flight).await {
                 Ok(base::upload::File::File(f)) => return Ok(f.bytes),
                 Ok(base::upload::File::FileCdnRedirect(_)) => {
                     return Err(Error::Unexpected("upload.getFile redirected to a CDN without cdn_supported"));
@@ -275,7 +279,7 @@ async fn from_cdn(
     let (cdn, failed) = (&cdn, &AtomicBool::new(cdn.is_none()));
     let part = move |i: usize, offset: i64| async move {
         if let (Some((cdn, dc, lease)), false) = (cdn, failed.load(Ordering::Acquire)) {
-            match cdn.part(&lease.sessions[i % lease.sessions.len()], offset, CHUNK).await {
+            match cdn.part(&lease.sessions[i % lease.sessions.len()], offset, CHUNK, master.in_flight).await {
                 Ok(bytes) if fits(offset, &bytes, size).is_ok() => return Ok(bytes),
                 Ok(_) => failed.store(true, Ordering::Release),
                 Err(e) => {
@@ -597,6 +601,7 @@ mod tests {
         let master = Master {
             client: &client,
             sessions: &sessions,
+            in_flight: 2,
             source: None,
             location: Mutex::new((get_file(b"old", 0, false).location, 0)),
             renewing: tokio::sync::Mutex::new(()),
@@ -837,6 +842,7 @@ mod tests {
         let master = Master {
             client: &client,
             sessions: &sessions,
+            in_flight: 1,
             source: Some(DownloadSource::Message(-5, 5)),
             location: Mutex::new((get_file(b"old", 0, false).location, 0)),
             renewing: tokio::sync::Mutex::new(()),
