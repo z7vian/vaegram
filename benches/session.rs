@@ -40,6 +40,28 @@ fn report_rss(when: &str) {
     }
 }
 
+/// User plus system CPU time of the whole process, the in-process mock DC included; Linux only.
+fn cpu_time() -> Option<Duration> {
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    // utime and stime are fields 14 and 15; the command name before ')' may hold spaces.
+    let mut fields = stat.rsplit_once(')')?.1.split_whitespace().skip(11);
+    let ticks = fields.next()?.parse::<u64>().ok()? + fields.next()?.parse::<u64>().ok()?;
+    // In clock ticks of USER_HZ, which Linux fixes at 100 for everything it exports to user space.
+    Some(Duration::from_millis(ticks * 10))
+}
+
+/// The transfer's MiB/s, then (Linux only) the CPU milliseconds the process spent per MiB moved.
+async fn measured_transfer(client: &Client, upload: bool, latency_ms: u64) {
+    let direction = if upload { "upload" } else { "download" };
+    let before = cpu_time();
+    report(direction, latency_ms, transfer(client, upload).await, "MiB/s");
+    if let (Some(before), Some(after)) = (before, cpu_time()) {
+        let mib = (TRANSFER_PARTS * PART) as f64 / (1 << 20) as f64;
+        let cpu_ms = after.saturating_sub(before).as_secs_f64() * 1e3;
+        report(&format!("cpu_ms_per_mib_{direction}"), latency_ms, cpu_ms / mib, "cpu ms/MiB");
+    }
+}
+
 async fn requests(client: &Client, depth: usize, ping: bool) -> f64 {
     let done = Arc::new(AtomicU64::new(0));
     let start = Instant::now();
@@ -159,8 +181,8 @@ async fn bench(latency_ms: u64) {
     report("echo", latency_ms, pushed(&mock, || stats.sent.load(Ordering::Relaxed), ECHOES).await, "round trips/s");
     echo.store(false, Ordering::Relaxed);
 
-    report("upload", latency_ms, transfer(&client, true).await, "MiB/s");
-    report("download", latency_ms, transfer(&client, false).await, "MiB/s");
+    measured_transfer(&client, true, latency_ms).await;
+    measured_transfer(&client, false, latency_ms).await;
     assert_eq!(mock.stats.parts_saved.load(Ordering::Relaxed), TRANSFER_PARTS as u64);
     runner.abort();
     report_rss(&format!("after_{latency_ms}ms"));
