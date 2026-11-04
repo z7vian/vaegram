@@ -5,6 +5,8 @@ mod file_format;
 mod file_storage;
 mod memory_storage;
 pub mod recording;
+#[cfg(feature = "redis")]
+mod redis_storage;
 pub mod session_string;
 pub mod state;
 mod store;
@@ -12,6 +14,8 @@ mod store;
 pub use engine::{PeerRecord, Storage, StorageFuture, StoredState};
 pub use file_storage::FileStorage;
 pub use memory_storage::MemoryStorage;
+#[cfg(feature = "redis")]
+pub use redis_storage::RedisStorage;
 #[cfg(test)]
 pub(crate) use store::Recording;
 pub(crate) use store::Store;
