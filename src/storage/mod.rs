@@ -5,6 +5,7 @@ pub(crate) mod conformance;
 mod engine;
 mod file_format;
 mod file_storage;
+mod hybrid_storage;
 mod memory_storage;
 pub mod recording;
 #[cfg(feature = "redis")]
@@ -15,6 +16,7 @@ mod store;
 
 pub use engine::{PeerRecord, Storage, StorageFuture, StoredState};
 pub use file_storage::FileStorage;
+pub use hybrid_storage::HybridStorage;
 pub use memory_storage::MemoryStorage;
 #[cfg(feature = "redis")]
 pub use redis_storage::RedisStorage;
