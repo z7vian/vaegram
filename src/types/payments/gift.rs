@@ -145,7 +145,6 @@ impl UniqueGift {
                 base::StarGiftAttribute::StarGiftAttributeOriginalDetails(a) => {
                     original_details = Some(UpgradedGiftOriginalDetails::parse(a, entities))
                 }
-                _ => {}
             }
         }
         UniqueGift {
@@ -359,10 +358,10 @@ mod tests {
             sender_id: Some(crate::utils::get_peer(8)),
             recipient_id: crate::utils::get_peer(9),
             date: 77,
-            message: Some(base::TextWithEntities::TextWithEntities(types::TextWithEntities {
+            message: Some(base::TextWithEntities::TextWithEntities(Box::new(types::TextWithEntities {
                 text: "hi".into(),
                 entities: Vec::new(),
-            })),
+            }))),
         };
         let raw = types::StarGiftUnique {
             owner_id: Some(crate::utils::get_peer(9)),
