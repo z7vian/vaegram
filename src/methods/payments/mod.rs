@@ -50,6 +50,7 @@ mod transfer_gift;
 mod upgrade_gift;
 
 pub use convert_gift_to_stars::ConvertGiftToStars;
+pub use delete_gift::DeleteGift;
 pub use get_chat_gifts::GetChatGifts;
 pub use get_gifts_for_crafting::GetGiftsForCrafting;
 pub use get_star_transactions::GetStarTransactions;
