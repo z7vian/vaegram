@@ -12,16 +12,30 @@ use crate::types::{ForumTopic, Media, Message, Story};
 type Found<T> = HashMap<(i64, i32), Option<T>>;
 
 impl Client {
-    /// Fills what the fetch options ask for before handlers see the messages: the replied and pinned messages, forum
-    /// topics, stories and sticker set names. A fetched message gets its topic, stories and set names too, but no
-    /// reply or pin of its own. Handlers wait for this, so nothing here sleeps off a FLOOD_WAIT or waits past
-    /// `request_timeout`: a flood or a timeout leaves every slot empty, and the helpers ask on demand.
+    /// Fills what the fetch options ask for, for messages handlers are about to see or a read is about to return:
+    /// the replied and pinned messages, forum topics, stories and sticker set names, in one batch for all of them.
+    /// A fetched message gets its topic, stories and set names too, but no reply or pin of its own. The caller
+    /// waits for this, so nothing here sleeps off a FLOOD_WAIT or waits past `request_timeout`: a flood or a
+    /// timeout leaves every slot empty, and the helpers ask on demand.
     pub(crate) async fn prefetch(&self, messages: &mut [Message]) {
-        if !self.0.fetch.any() {
+        if !self.0.fetch.any() || messages.is_empty() {
             return;
         }
         let fill = without_retries(self.fill(messages));
         let _ = tokio::time::timeout(self.0.options.request_timeout, fill).await;
+    }
+
+    /// `prefetch` for a read whose answer has holes where messages are missing.
+    pub(crate) async fn prefetch_found(&self, messages: &mut [Option<Message>]) {
+        if !self.0.fetch.any() {
+            return;
+        }
+        let at: Vec<usize> = messages.iter().enumerate().filter(|(_, m)| m.is_some()).map(|(i, _)| i).collect();
+        let mut found: Vec<Message> = messages.iter_mut().filter_map(Option::take).collect();
+        self.prefetch(&mut found).await;
+        for (i, message) in at.into_iter().zip(found) {
+            messages[i] = Some(message);
+        }
     }
 
     // The slots change only after the last request, so a timeout can't leave them half filled.
@@ -552,5 +566,90 @@ mod tests {
         sent.try_recv().unwrap();
         assert_eq!(set_name(&m), None);
         assert!(client.0.caches.set_name(10).is_none());
+    }
+
+    fn replying(id: i32, to: i32) -> types::Message {
+        let mut raw = Message::bare(id, get_peer(-5), 0);
+        let header = types::MessageReplyHeader { reply_to_msg_id: Some(to), ..header() };
+        raw.reply_to = Some(base::MessageReplyHeader::MessageReplyHeader(Box::new(header)));
+        raw
+    }
+
+    fn history_page() -> Vec<types::Message> {
+        vec![replying(12, 1), replying(11, 2), Message::bare(10, get_peer(-5), 0)]
+    }
+
+    #[tokio::test]
+    async fn a_history_page_fetches_its_replies_in_one_request() {
+        let replied = vec![Message::bare(1, get_peer(-5), 0), Message::bare(2, get_peer(-5), 0)];
+        let (client, mut sent) = client(REPLIES, false, vec![found(history_page()), found(replied)]);
+        let mut history = client.get_chat_history(-5).limit(3);
+        let mut read = Vec::new();
+        while let Some(m) = history.next().await.unwrap() {
+            read.push(m);
+        }
+        sent.try_recv().unwrap();
+        assert_eq!(sent.try_recv().unwrap(), get_messages(&[1, 2]));
+        assert!(sent.try_recv().is_err(), "one getMessages for the page");
+        let mut replies = Vec::new();
+        for m in &read {
+            replies.push(m.reply_to_message().await.unwrap().map(|r| r.id));
+        }
+        assert_eq!(replies, [Some(1), Some(2), None]);
+        assert!(sent.try_recv().is_err(), "a reply was fetched again");
+    }
+
+    #[tokio::test]
+    async fn fetch_off_history_sends_one_request_per_page() {
+        let (client, mut sent) = client(Fetch::default(), false, vec![found(history_page())]);
+        let mut history = client.get_chat_history(-5).limit(3);
+        let mut count = 0;
+        while history.next().await.unwrap().is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 3);
+        sent.try_recv().unwrap();
+        assert!(sent.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn get_messages_prefetches() {
+        let (client, mut sent) =
+            client(REPLIES, false, vec![found(vec![replying(9, 4)]), found(vec![Message::bare(4, get_peer(-5), 0)])]);
+        let got = client.get_messages(-5, &[9]).await.unwrap();
+        assert_eq!(sent.try_recv().unwrap(), get_messages(&[9]));
+        assert_eq!(sent.try_recv().unwrap(), get_messages(&[4]));
+        let [Some(m)] = got.as_slice() else { panic!("{got:?}") };
+        assert_eq!(m.reply_to_message().await.unwrap().map(|r| r.id), Some(4));
+        assert!(sent.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn topics_and_stories_batch_per_chat() {
+        let fetch = Fetch { topics: true, stories: true, ..Fetch::default() };
+        let (client, mut sent) = client(fetch, false, vec![refused("CHANNEL_PRIVATE"), refused("PEER_ID_INVALID")]);
+        let input =
+            base::InputPeer::InputPeerChannel(Box::new(types::InputPeerChannel { channel_id: 9, access_hash: 1 }));
+        client.0.peers.lock().unwrap().insert(get_channel_id(9), input.clone());
+        let mut batch: Vec<Message> = [(1, 6, 4), (2, 6, 5), (3, 7, 4)]
+            .into_iter()
+            .map(|(id, thread, story)| {
+                let raw = Message::bare(id, get_peer(get_channel_id(9)), 0);
+                let mut m = Message::parse(&client, Box::new(raw), &crate::dispatcher::Entities::default());
+                (m.chat.is_forum, m.message_thread_id) = (true, Some(thread));
+                (m.reply_to_story_id, m.reply_to_story_user_id) = (Some(story), Some(0));
+                m
+            })
+            .collect();
+        client.prefetch(&mut batch).await;
+        // One request per chat for each kind; the two kinds go out together, in either order.
+        let topics = messages::GetForumTopicsByID { peer: input, topics: vec![6, 7] }.to_bytes();
+        let stories = stories::GetStoriesByID { peer: base::InputPeer::InputPeerSelf, id: vec![4, 5] }.to_bytes();
+        let mut got = [sent.try_recv().unwrap(), sent.try_recv().unwrap()];
+        got.sort();
+        let mut want = [topics, stories];
+        want.sort();
+        assert_eq!(got, want);
+        assert!(sent.try_recv().is_err());
     }
 }
