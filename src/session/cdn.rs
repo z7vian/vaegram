@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::transfer::{invoke_cdn_part, invoke_part};
+use super::transfer::{CdnAnswer, FilePart, invoke_cdn_part, invoke_part};
 use super::{Session, init_connection};
 use crate::connection::Options;
 use crate::crypto::{aes, sha256};
@@ -46,7 +46,8 @@ impl<'a> Cdn<'a> {
     }
 
     /// `in_flight`: the parts each connection carries, the master's included, which sets how long one may take.
-    pub(crate) async fn part(&self, session: &Session, offset: i64, limit: i32, in_flight: usize) -> Result<Vec<u8>> {
+    /// The part is decrypted where it lies in the answer.
+    pub(crate) async fn part(&self, session: &Session, offset: i64, limit: i32, in_flight: usize) -> Result<FilePart> {
         let mut reuploads = 0;
         let mut bytes = loop {
             let request = functions::upload::GetCdnFile { file_token: self.token.clone(), offset, limit };
@@ -62,16 +63,13 @@ impl<'a> Cdn<'a> {
                 invoke_cdn_part(session, &init, in_flight).await?
             };
             match file {
-                base::upload::CdnFile::CdnFile(f) => break f.bytes,
-                base::upload::CdnFile::CdnFileReuploadNeeded(r) if reuploads < MAX_REUPLOADS => {
-                    let reupload = functions::upload::ReuploadCdnFile {
-                        file_token: self.token.clone(),
-                        request_token: r.request_token,
-                    };
+                CdnAnswer::Part(part) => break part,
+                CdnAnswer::ReuploadNeeded(request_token) if reuploads < MAX_REUPLOADS => {
+                    let reupload = functions::upload::ReuploadCdnFile { file_token: self.token.clone(), request_token };
                     self.add(invoke_part(self.master, &reupload, in_flight).await?);
                     reuploads += 1;
                 }
-                base::upload::CdnFile::CdnFileReuploadNeeded(_) => {
+                CdnAnswer::ReuploadNeeded(_) => {
                     return Err(Error::Unexpected("the CDN keeps asking for upload.reuploadCdnFile"));
                 }
             }
@@ -79,7 +77,7 @@ impl<'a> Cdn<'a> {
         if bytes.len() > limit as usize {
             return Err(Error::Unexpected("upload.getCdnFile returned more than the limit"));
         }
-        decrypt(&mut bytes, &self.key, &self.iv, offset);
+        decrypt(bytes.as_mut_slice(), &self.key, &self.iv, offset);
 
         let mut checked = 0;
         loop {

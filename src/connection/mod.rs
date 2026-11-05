@@ -24,6 +24,8 @@ use fake_tls::{RecordReader, RecordWriter};
 use obfuscated::Ctr;
 
 const READ_CHUNK: usize = 64 << 10;
+// What an idle connection's buffers may keep; past it, a big packet's memory goes back.
+const IDLE_KEEP: usize = 4 * READ_CHUNK;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -202,6 +204,11 @@ impl Reader {
             }
         }
     }
+
+    /// Gives back what a big packet grew the buffer to, once nothing waits in it.
+    pub(crate) fn shrink_idle(&mut self) {
+        self.buf.shrink_idle(IDLE_KEEP);
+    }
 }
 
 struct Wire {
@@ -231,6 +238,13 @@ impl Writer {
     pub(crate) fn begin(&mut self) {
         self.buf.clear();
         self.buf.resize(Framing::ROOM, 0);
+    }
+
+    /// Gives back what a big packet grew the buffer to; `begin` sizes it again for the next one.
+    pub(crate) fn shrink_idle(&mut self) {
+        if self.buf.capacity() > IDLE_KEEP {
+            self.buf = Vec::new();
+        }
     }
 
     pub(crate) async fn finish(&mut self) -> Result<()> {

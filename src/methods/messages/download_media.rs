@@ -15,7 +15,7 @@ use crate::errors::{Error, Result};
 use crate::raw::{base, functions, types};
 use crate::session::Session;
 use crate::session::cdn::Cdn;
-use crate::session::transfer::{Progress, Report, per_connection, take, try_join_all, workers};
+use crate::session::transfer::{FileAnswer, FilePart, Progress, Report, per_connection, take, try_join_all, workers};
 use crate::types::FileLocation;
 
 // https://core.telegram.org/api/files#downloading-files: a limit that divides 1 MB, at offsets that are
@@ -217,13 +217,11 @@ impl<'a> DownloadMedia<'a> {
         };
         let master = &master;
         match file {
-            base::upload::File::File(f) => {
+            FileAnswer::Part(first) => {
                 let part = move |i, offset| master.part(i, offset);
-                write_all(f.bytes, &window, size, workers, sink, &progress, part).await
+                write_all(first, &window, size, workers, sink, &progress, part).await
             }
-            base::upload::File::FileCdnRedirect(r) => {
-                from_cdn(master, *r, &window, size, workers, sink, &progress).await
-            }
+            FileAnswer::Redirect(r) => from_cdn(master, *r, &window, size, workers, sink, &progress).await,
         }
     }
 }
@@ -240,7 +238,7 @@ struct Master<'a> {
 }
 
 impl Master<'_> {
-    async fn part(&self, worker: usize, offset: i64) -> Result<Vec<u8>> {
+    async fn part(&self, worker: usize, offset: i64) -> Result<FilePart> {
         let session = &self.sessions[worker % self.sessions.len()];
         let mut renewed = false;
         loop {
@@ -248,8 +246,8 @@ impl Master<'_> {
             let request =
                 functions::upload::GetFile { precise: false, cdn_supported: false, location, offset, limit: CHUNK };
             match self.client.invoke_file_part(session, &request, self.in_flight).await {
-                Ok(base::upload::File::File(f)) => return Ok(f.bytes),
-                Ok(base::upload::File::FileCdnRedirect(_)) => {
+                Ok(FileAnswer::Part(part)) => return Ok(part),
+                Ok(FileAnswer::Redirect(_)) => {
                     return Err(Error::Unexpected("upload.getFile redirected to a CDN without cdn_supported"));
                 }
                 Err(Error::Rpc(e)) if e.name.starts_with("FILE_REFERENCE_") && !renewed => {
@@ -335,8 +333,8 @@ async fn from_cdn(
     write_all(part(0, window.first_offset()).await?, window, size, workers, sink, progress, part).await
 }
 
-async fn write_all<F: Future<Output = Result<Vec<u8>>>>(
-    first: Vec<u8>,
+async fn write_all<F: Future<Output = Result<FilePart>>>(
+    first: FilePart,
     window: &Window,
     size: Option<i64>,
     workers: usize,
@@ -364,7 +362,7 @@ async fn write_all<F: Future<Output = Result<Vec<u8>>>>(
     Ok(())
 }
 
-async fn chunks<F: Future<Output = Result<Vec<u8>>>>(
+async fn chunks<F: Future<Output = Result<FilePart>>>(
     next: &AtomicI32,
     window: &Window,
     size: Option<i64>,
@@ -521,13 +519,13 @@ enum Sink {
 impl Sink {
     /// Writes the part of a chunk at `offset` that falls in `window`, placed relative to its start; returns the bytes
     /// written.
-    async fn write_at(&self, window: &Window, offset: u64, mut bytes: Vec<u8>) -> Result<usize> {
+    async fn write_at(&self, window: &Window, offset: u64, mut bytes: FilePart) -> Result<usize> {
         let raw = bytes.len() as u64;
         if window.end != END {
             bytes.truncate(window.end.saturating_sub(offset).min(raw) as usize);
         }
         let head = window.start.saturating_sub(offset).min(bytes.len() as u64) as usize;
-        bytes.drain(..head);
+        bytes.skip(head);
         let at = offset.saturating_add(head as u64).saturating_sub(window.start);
         let written = bytes.len();
         match self {
@@ -554,7 +552,7 @@ impl Sink {
                     return Ok(0);
                 }
                 if written > 0 {
-                    let _ = chunks.send(bytes).await;
+                    let _ = chunks.send(bytes.into_vec()).await;
                 }
                 let next = offset.saturating_add(raw);
                 sent.send_replace(if raw < CHUNK as u64 || next >= window.end { END } else { next });
@@ -659,7 +657,7 @@ mod tests {
     async fn writes_chunks_at_their_offsets() {
         let sink = Sink::Memory(Mutex::new(Vec::new()));
         for (offset, chunk) in [(6, &b"gh"[..]), (0, b"abc"), (3, b"def")] {
-            sink.write_at(&Window::ALL, offset, chunk.to_vec()).await.unwrap();
+            sink.write_at(&Window::ALL, offset, chunk.to_vec().into()).await.unwrap();
         }
         let Sink::Memory(out) = sink else { unreachable!() };
         assert_eq!(out.into_inner().unwrap(), b"abcdefgh");
@@ -669,10 +667,10 @@ mod tests {
     async fn memory_that_cant_be_had_is_an_error_not_an_abort() {
         let sink = Sink::Memory(Mutex::new(b"ab".to_vec()));
         // Past isize::MAX no allocator can serve it, so the reservation fails before allocating anything.
-        let out_of_memory = sink.write_at(&Window::ALL, isize::MAX as u64, b"x".to_vec()).await;
+        let out_of_memory = sink.write_at(&Window::ALL, isize::MAX as u64, b"x".to_vec().into()).await;
         let oom = |e: &std::io::Error| e.kind() == std::io::ErrorKind::OutOfMemory;
         assert!(matches!(&out_of_memory, Err(Error::Io(e)) if oom(e)), "{out_of_memory:?}");
-        let unaddressable = sink.write_at(&Window::ALL, u64::MAX, b"x".to_vec()).await;
+        let unaddressable = sink.write_at(&Window::ALL, u64::MAX, b"x".to_vec().into()).await;
         assert!(matches!(unaddressable, Err(Error::Unexpected(_))), "{unaddressable:?}");
         let Sink::Memory(out) = sink else { unreachable!() };
         assert_eq!(out.into_inner().unwrap(), b"ab");
@@ -698,7 +696,7 @@ mod tests {
                     for _ in 0..delay {
                         tokio::task::yield_now().await;
                     }
-                    sink.write_at(&Window::ALL, (n * c) as u64, vec![n as u8; len]).await
+                    sink.write_at(&Window::ALL, (n * c) as u64, vec![n as u8; len].into()).await
                 }
             };
             // Chunk 3 is short, so it ends the file and chunk 4 is dropped.

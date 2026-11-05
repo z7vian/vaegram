@@ -6,7 +6,7 @@ use crate::client::{Borrowed, quiet};
 use crate::errors::{Error, Result, RpcError};
 use crate::raw::{RemoteCall, functions};
 use crate::session::no_updates::needs_updates;
-use crate::session::transfer::invoke_part;
+use crate::session::transfer::{FileAnswer, invoke_file_part};
 use crate::session::{RateCategory, Session};
 
 const MAX_MIGRATIONS: usize = 3;
@@ -98,20 +98,20 @@ impl Client {
         }
     }
 
-    /// A file part on a transfer connection carrying `in_flight` parts, inside this client's takeout session if it
-    /// has one.
-    pub(crate) async fn invoke_file_part<R: RemoteCall>(
+    /// An `upload.getFile` part on a transfer connection carrying `in_flight` parts, inside this client's takeout
+    /// session if it has one; the part's bytes stay in the answer they came in.
+    pub(crate) async fn invoke_file_part(
         &self,
         session: &Session,
-        request: &R,
+        request: &functions::upload::GetFile,
         in_flight: usize,
-    ) -> Result<R::Return> {
+    ) -> Result<FileAnswer> {
         match self.1 {
             Some(takeout_id) => {
                 let request = functions::InvokeWithTakeout { takeout_id, query: Borrowed(request) };
-                invoke_part(session, &request, in_flight).await
+                invoke_file_part(session, &request, in_flight).await
             }
-            None => invoke_part(session, request, in_flight).await,
+            None => invoke_file_part(session, request, in_flight).await,
         }
     }
 
@@ -492,14 +492,27 @@ mod tests {
         assert_eq!(taken(&client), [Admin, Global]);
     }
 
+    fn get_file() -> functions::upload::GetFile {
+        let location = types::InputDocumentFileLocation {
+            id: 1,
+            access_hash: 2,
+            file_reference: Vec::new(),
+            thumb_size: String::new(),
+        };
+        let location = base::InputFileLocation::InputDocumentFileLocation(Box::new(location));
+        functions::upload::GetFile { precise: false, cdn_supported: false, location, offset: 0, limit: 1024 }
+    }
+
     #[tokio::test]
     async fn file_parts_and_difference_are_not_limited() {
-        let replies = (0..4).map(|_| Ok(true.to_bytes())).collect();
+        let file = types::upload::File { r#type: base::storage::FileType::FilePartial, mtime: 0, bytes: vec![1] };
+        let mut replies = vec![Ok(base::upload::File::File(Box::new(file)).to_bytes())];
+        replies.extend((0..3).map(|_| Ok(true.to_bytes())));
         let (mut client, _sent) = Client::scripted(replies);
         limited(&mut client);
         let session = client.session();
         // File parts go to their connection, and the dispatcher's getDifference straight to the session.
-        client.invoke_file_part(&session, &set_typing(), 1).await.unwrap();
+        client.invoke_file_part(&session, &get_file(), 1).await.unwrap();
         session.invoke(&set_typing()).await.unwrap();
         assert!(taken(&client).is_empty());
 
