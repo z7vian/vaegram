@@ -1,0 +1,24 @@
+name: bench-ab
+
+on: [push]
+
+jobs:
+  ab:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - run: git worktree add ../base origin/ci/w4-P2-base
+      - run: cargo bench --bench session --no-run
+      - run: cargo bench --bench session --no-run
+        working-directory: ../base
+      - name: alternate base and candidate
+        run: |
+          for i in 1 2 3 4 5; do
+            (cd ../base && cargo bench --bench session) | grep -E 'cpu_ms_per_mib|rss_after' | sed "s/^/base $i /"
+            cargo bench --bench session | grep -E 'cpu_ms_per_mib|rss_after' | sed "s/^/cand $i /"
+          done
