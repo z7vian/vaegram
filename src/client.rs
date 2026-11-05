@@ -43,6 +43,11 @@ pub struct ClientBuilder {
     test_mode: bool,
     ipv6: bool,
     pfs: bool,
+    #[cfg(feature = "dns-config")]
+    dns_fallback: bool,
+    // Stands in for the fetched DNS config.
+    #[cfg(all(test, feature = "dns-config"))]
+    dns_config: Option<crate::connection::DnsConfig>,
     login: Login,
     parse_mode: ParseMode,
     link_preview_options: Option<LinkPreviewOptions>,
@@ -175,6 +180,16 @@ impl ClientBuilder {
     #[cfg(feature = "websocket")]
     pub fn websocket(mut self) -> Self {
         self.options.websocket = true;
+        self
+    }
+
+    /// When neither the saved address nor the built-in one of the account's data center answers, fetches the
+    /// config Telegram publishes in DNS (over HTTPS, from Google's resolver and then Cloudflare's, straight rather
+    /// than through a proxy), checks its signature and expiry, and tries the plain addresses it lists for that data
+    /// center. Off by default.
+    #[cfg(feature = "dns-config")]
+    pub fn dns_fallback(mut self) -> Self {
+        self.dns_fallback = true;
         self
     }
 
@@ -499,10 +514,25 @@ impl ClientBuilder {
         let saved = auth_key.map(|key| (key, salt));
         let try_addr = |addr| connect(dc(addr), saved, self.api_id, &self.options, events.clone(), self.pfs);
         // A saved address comes from help.getConfig and can go stale.
-        let (session, updates, dc_options) = match (try_addr(first).await, built_in) {
-            (Err(_), Some(built_in)) if built_in != first && pinned.is_none() => try_addr(built_in).await?,
-            (result, _) => result?,
+        let result = match (try_addr(first).await, built_in) {
+            (Err(_), Some(built_in)) if built_in != first && pinned.is_none() => try_addr(built_in).await,
+            (result, _) => result,
         };
+        #[cfg(feature = "dns-config")]
+        let result = match result {
+            Err(error) if self.dns_fallback && pinned.is_none() => {
+                let mut result = Err(error);
+                for addr in self.dns_addresses(dc_id, test_mode).await {
+                    result = try_addr(addr).await;
+                    if result.is_ok() {
+                        break;
+                    }
+                }
+                result
+            }
+            result => result,
+        };
+        let (session, updates, dc_options) = result?;
         let mut inner = Inner::new(session, updates, store);
         inner.peers.get_mut().unwrap_or_else(PoisonError::into_inner).load(warm);
         inner.api_id = self.api_id;
@@ -544,6 +574,18 @@ impl ClientBuilder {
         }
         client.save().await?;
         Ok((client, self.login))
+    }
+
+    /// The unexpired plain addresses of data center `dc_id` in Telegram's DNS config; none if it can't be had.
+    #[cfg(feature = "dns-config")]
+    async fn dns_addresses(&self, dc_id: i32, test_mode: bool) -> Vec<SocketAddr> {
+        use crate::connection::DnsConfig;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        #[cfg(test)]
+        if let Some(config) = &self.dns_config {
+            return config.plain_addresses(dc_id, now);
+        }
+        DnsConfig::fetch(test_mode).await.map(|config| config.plain_addresses(dc_id, now)).unwrap_or_default()
     }
 }
 
@@ -752,6 +794,10 @@ impl Client {
             test_mode: false,
             ipv6: false,
             pfs: false,
+            #[cfg(feature = "dns-config")]
+            dns_fallback: false,
+            #[cfg(all(test, feature = "dns-config"))]
+            dns_config: None,
             login: Login::default(),
             parse_mode: ParseMode::Disabled,
             link_preview_options: None,
@@ -1088,6 +1134,68 @@ mod tests {
             let refused = Client::builder("limits", 1, "hash").in_memory().rate_limits(limits).connect().await;
             assert!(matches!(refused, Err(Error::InvalidArgument(_))));
         }
+    }
+
+    // The saved and built-in addresses refuse; only the DNS config's address reaches the test DC. Returns the
+    // outcome and every address dialed.
+    #[cfg(feature = "dns-config")]
+    async fn open_via_dns(expires: i32) -> (Result<Client, Error>, Vec<std::net::SocketAddr>) {
+        use std::net::SocketAddr;
+
+        use crate::connection::{AccessPointRule, DnsConfig, IpPort};
+        let dc = TestDc::start([5; 256], false).await;
+        let real = dc.dc(2).addr;
+        let via: SocketAddr = "10.0.0.9:443".parse().unwrap();
+        let dialed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = dialed.clone();
+        let factory = move |addr: SocketAddr| {
+            seen.lock().unwrap().push(addr);
+            async move {
+                match addr == via {
+                    true => tokio::net::TcpStream::connect(real).await,
+                    false => Err(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "unreachable")),
+                }
+            }
+        };
+        let saved = SessionData {
+            dc_id: 2,
+            test_mode: false,
+            addr: Some("10.0.0.1:443".parse().unwrap()),
+            api_id: 1,
+            auth_key: [5; 256],
+            user_id: 0,
+            is_bot: false,
+        };
+        let session = crate::storage::session_string::export(&saved);
+        let mut builder = Client::builder("dns", 1, "hash").session_string(session).connection_factory(factory);
+        builder = builder.dns_fallback();
+        let ip = IpPort { addr: "10.0.0.9:443".parse().unwrap(), secret: None };
+        let rule = AccessPointRule { phone_prefix_rules: String::new(), dc_id: 2, ips: vec![ip] };
+        builder.dns_config = Some(DnsConfig { date: 0, expires, rules: vec![rule] });
+        let client = builder.connect().await;
+        let dialed = dialed.lock().unwrap().clone();
+        (client, dialed)
+    }
+
+    #[cfg(feature = "dns-config")]
+    #[tokio::test]
+    async fn fallback_tries_dns_addresses_after_both_fail() {
+        let (client, dialed) = open_via_dns(i32::MAX).await;
+        client.unwrap();
+        let built_in = super::data_center::address(2, false, false).unwrap();
+        let at = |addr: &str| dialed.iter().position(|a| *a == addr.parse().unwrap());
+        let (saved, dns) = (at("10.0.0.1:443"), at("10.0.0.9:443"));
+        let built_in = dialed.iter().position(|a| *a == built_in);
+        assert!(saved < built_in && built_in < dns && saved.is_some(), "{dialed:?}");
+        assert_eq!(dns, Some(dialed.len() - 1), "{dialed:?}");
+    }
+
+    #[cfg(feature = "dns-config")]
+    #[tokio::test]
+    async fn an_expired_dns_config_is_ignored() {
+        let (client, dialed) = open_via_dns(1).await;
+        assert!(client.is_err());
+        assert!(!dialed.contains(&"10.0.0.9:443".parse().unwrap()), "{dialed:?}");
     }
 
     #[tokio::test]
