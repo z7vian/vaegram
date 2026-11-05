@@ -1,4 +1,4 @@
-use super::{Runner, internals};
+use super::{FutureSalt, Runner, internals};
 use crate::errors::Error;
 use crate::raw::{Deserializable, Serializable, base, types};
 
@@ -43,6 +43,13 @@ impl Runner {
                 self.resend(id);
             }
             self.request_difference();
+        }
+    }
+
+    pub(super) fn handle_future_salts(&mut self, body: &[u8]) {
+        if let Some(salts) = future_salts(body) {
+            self.future_salts = salts;
+            self.rotate_salt();
         }
     }
 
@@ -139,4 +146,30 @@ impl Runner {
 // re-sending could run it twice.
 fn never_got(status: u8) -> bool {
     (1..=3).contains(&(status & 7)) && status & (32 | 64 | 128) == 0
+}
+
+const VECTOR: u32 = 0x1cb5_c415;
+
+/// `future_salts req_msg_id:long now:int salts:vector<future_salt>`, read by hand: the vector is bare and each salt
+/// is `valid_since:int valid_until:int salt:long`. A boxed vector, or salts with their constructor, are taken too.
+pub(super) fn future_salts(body: &[u8]) -> Option<Vec<FutureSalt>> {
+    let mut buf = body.get(4 + 8 + 4..)?;
+    let mut count = u32::deserialize(&mut buf).ok()?;
+    if count == VECTOR {
+        count = u32::deserialize(&mut buf).ok()?;
+    }
+    let count = usize::try_from(count).ok().filter(|&c| c > 0)?;
+    let size = match buf.len() / count {
+        size @ (16 | 20) if buf.len() % count == 0 => size,
+        _ => return None,
+    };
+    let salts = buf.chunks_exact(size).map(|salt| {
+        let mut salt = &salt[size - 16..];
+        Some(FutureSalt {
+            valid_since: i32::deserialize(&mut salt).ok()?,
+            valid_until: i32::deserialize(&mut salt).ok()?,
+            salt: i64::deserialize(&mut salt).ok()?,
+        })
+    });
+    salts.collect()
 }

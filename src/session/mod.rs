@@ -55,6 +55,14 @@ const MSG_DETAILED_INFO: u32 = <types::MsgDetailedInfo as Identifiable>::CONSTRU
 const MSG_NEW_DETAILED_INFO: u32 = <types::MsgNewDetailedInfo as Identifiable>::CONSTRUCTOR_ID;
 const MSG_RESEND_REQ: u32 = <types::MsgResendReq as Identifiable>::CONSTRUCTOR_ID;
 const MSGS_ACK: u32 = <types::MsgsAck as Identifiable>::CONSTRUCTOR_ID;
+// The salts to come, asked for by hand: neither has generated code.
+const GET_FUTURE_SALTS: u32 = 0xb921_bd04;
+const FUTURE_SALTS: u32 = 0xae50_0895;
+// Each salt is good for about an hour, so four of them, asked for again every hour, leave no gap.
+const FUTURE_SALTS_ASKED: i32 = 4;
+const FUTURE_SALTS_EVERY: Duration = Duration::from_secs(60 * 60);
+// The first ask waits until the connection has settled, so connecting stays as short as it was.
+const FIRST_SALTS_AFTER: Duration = Duration::from_secs(10);
 
 const HANDSHAKE_ATTEMPTS: usize = 3;
 const PING_EVERY: Duration = Duration::from_secs(60);
@@ -662,6 +670,17 @@ struct Runner {
     link_up: bool,
     last_read: tokio::time::Instant,
     probed: bool,
+    // The salts the server announced, and when they were last asked for.
+    future_salts: Vec<FutureSalt>,
+    salts_asked: Option<tokio::time::Instant>,
+}
+
+/// A salt and the server times, in Unix seconds, it's good between.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FutureSalt {
+    valid_since: i32,
+    valid_until: i32,
+    salt: i64,
 }
 
 impl Runner {
@@ -701,6 +720,8 @@ impl Runner {
             link_up: true,
             last_read: tokio::time::Instant::now(),
             probed: false,
+            future_salts: Vec::new(),
+            salts_asked: tokio::time::Instant::now().checked_sub(FUTURE_SALTS_EVERY - FIRST_SALTS_AFTER),
         }
     }
 
@@ -848,6 +869,13 @@ impl Runner {
             }
         }
         self.drop_abandoned();
+        // A salt that runs out would cost a bad_server_salt and a resend; the next one is switched to on time.
+        self.rotate_salt();
+        if !self.unbound() && self.salts_asked.is_none_or(|asked| asked.elapsed() >= FUTURE_SALTS_EVERY) {
+            self.salts_asked = Some(tokio::time::Instant::now());
+            let request = [GET_FUTURE_SALTS.to_le_bytes(), FUTURE_SALTS_ASKED.to_le_bytes()].concat();
+            self.service.push_back((request, true));
+        }
         // Between transfers the buffers a big packet grew give their memory back; a part in flight keeps them.
         if self.pending.is_empty() {
             self.reader.shrink_idle();
@@ -925,6 +953,17 @@ impl Runner {
 
     fn set_salt(&mut self, salt: i64) {
         self.learned.salt.store(salt, Ordering::Relaxed);
+    }
+
+    /// Moves to the newest announced salt the server's clock has reached, and forgets the ones that ran out.
+    fn rotate_salt(&mut self) {
+        let now = internals::now() + self.msg_ids.time_offset;
+        self.future_salts.retain(|s| i64::from(s.valid_until) > now);
+        let current =
+            self.future_salts.iter().filter(|s| i64::from(s.valid_since) <= now).max_by_key(|s| s.valid_since);
+        if let Some(salt) = current.map(|s| s.salt).filter(|&salt| salt != self.salt()) {
+            self.set_salt(salt);
+        }
     }
 
     fn set_time_offset(&mut self, time_offset: i64) {
@@ -1090,6 +1129,7 @@ impl Runner {
             Some(BAD_SERVER_SALT | BAD_MSG_NOTIFICATION) => self.handle_bad_msg(msg_id, body),
             Some(NEW_SESSION_CREATED) => self.handle_new_session(body),
             Some(MSGS_ACK) => self.handle_msgs_ack(body),
+            Some(FUTURE_SALTS) => self.handle_future_salts(body),
             Some(PONG) => {
                 if let Ok(base::Pong::Pong(p)) = base::Pong::from_bytes(body) {
                     self.answer(p.msg_id, Ok(Body::from(body.to_vec())));
