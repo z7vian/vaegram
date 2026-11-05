@@ -47,7 +47,9 @@ async fn listening(salt: Salt) -> (Runner, Frames, UpdatesRx, TcpListener) {
     });
 
     let (events, (tx, rx)) = (Arc::default(), mpsc::channel(Options::default().updates_capacity));
-    let runner = Runner::new(dc, Arc::new(options), conn, ([7; 256], salt, true), Arc::clone(&events), Some(tx));
+    let mut runner = Runner::new(dc, Arc::new(options), conn, ([7; 256], salt, true), Arc::clone(&events), Some(tx));
+    // Tests that count frames don't expect get_future_salts; the ones about it move this up.
+    runner.salts_due = tokio::time::Instant::now() + Duration::from_secs(24 * 60 * 60);
     let updates = UpdatesRx { rx, events };
     (runner, frames, updates, listener)
 }
@@ -1315,4 +1317,96 @@ async fn container_answers_still_copy() {
     let error = types::RpcError { error_code: 400, error_message: b"PEER_ID_INVALID".to_vec() }.to_bytes();
     r.handle_packet(from_server(&r, 3, &rpc_result(req_msg_id, &error))).await.unwrap();
     assert!(matches!(failed.try_recv().unwrap(), Err(Error::Rpc(e)) if e.is("PEER_ID_INVALID")));
+}
+
+fn future_salts_body(salts: &[(i32, i32, i64)], boxed: bool) -> Vec<u8> {
+    let mut out = [&0xae50_0895u32.to_le_bytes()[..], &7i64.to_le_bytes(), &0i32.to_le_bytes()].concat();
+    if boxed {
+        out.extend_from_slice(&0x1cb5_c415u32.to_le_bytes());
+    }
+    out.extend_from_slice(&(salts.len() as u32).to_le_bytes());
+    for (valid_since, valid_until, salt) in salts {
+        out.extend_from_slice(&valid_since.to_le_bytes());
+        out.extend_from_slice(&valid_until.to_le_bytes());
+        out.extend_from_slice(&salt.to_le_bytes());
+    }
+    out
+}
+
+#[test]
+fn future_salts_bytes_decode() {
+    use super::FutureSalt;
+    use super::service::future_salts;
+    let want = [
+        FutureSalt { valid_since: 1, valid_until: 2, salt: 3 },
+        FutureSalt { valid_since: 2, valid_until: 4, salt: -5 },
+    ];
+    let raw = [(1, 2, 3), (2, 4, -5)];
+    assert_eq!(future_salts(&future_salts_body(&raw, false)).unwrap(), want);
+    assert_eq!(future_salts(&future_salts_body(&raw, true)).unwrap(), want);
+    let body = future_salts_body(&raw, false);
+    assert!(future_salts(&body[..body.len() - 1]).is_none());
+    assert!(future_salts(&body[..10]).is_none());
+    assert!(future_salts(&future_salts_body(&[], false)).is_none());
+}
+
+/// Whether the next frame carries a get_future_salts.
+async fn asks_for_salts(frames: &mut Frames, r: &Runner) -> bool {
+    let (_, _, body) = recv(frames, r).await;
+    let asked = [0xb921_bd04u32.to_le_bytes(), 4i32.to_le_bytes()].concat();
+    match constructor_id(&body) {
+        Some(msg_container::ID) => msg_container::parse(&body).unwrap().iter().any(|m| *m.body == *asked),
+        _ => body == asked,
+    }
+}
+
+#[tokio::test]
+async fn future_salts_are_requested_after_connect() {
+    let (mut r, mut frames, _updates) = runner().await;
+    r.salts_due = tokio::time::Instant::now();
+    r.tick().await.unwrap();
+    assert!(asks_for_salts(&mut frames, &r).await);
+    // Not again within the hour.
+    r.tick().await.unwrap();
+    assert!(r.service.is_empty());
+}
+
+#[tokio::test]
+async fn bad_server_salt_overrules_the_salt_list() {
+    let (mut r, mut frames, _updates) = runner().await;
+    let now = internals::now() as i32;
+    r.handle_future_salts(&future_salts_body(&[(now - 10, now + 3000, 5)], false));
+    assert_eq!(r.salt(), 5);
+    let salt = types::BadServerSalt { bad_msg_id: 1, bad_msg_seqno: 1, error_code: 48, new_server_salt: 9 };
+    r.handle_message(1, 0, &salt.to_bytes());
+    r.tick().await.unwrap();
+    assert_eq!(r.salt(), 9, "the next tick went back to the list's salt");
+    assert!(r.future_salts.is_empty());
+    // The overruled list, or a get_future_salts the bounce took with it, is asked for again.
+    assert!(asks_for_salts(&mut frames, &r).await);
+}
+
+#[tokio::test]
+async fn a_new_temp_key_forgets_the_old_salt_list() {
+    let (mut r, _frames, _updates) = runner().await;
+    let now = internals::now() as i32;
+    r.handle_future_salts(&future_salts_body(&[(now - 10, now + 3000, 5)], false));
+    r.use_temp_key(Created { auth_key: [8; 256], salt: 6, time_offset: 0 });
+    assert!(r.future_salts.is_empty());
+    r.tick().await.unwrap();
+    assert_eq!(r.salt(), 6, "the old key's salt came back");
+}
+
+#[tokio::test]
+async fn salt_switches_at_valid_since() {
+    let (mut r, _frames, _updates) = runner().await;
+    let now = internals::now() as i32;
+    let salts = [(now - 10, now + 100, 5), (now + 50, now + 200, 6), (now - 300, now - 1, 4)];
+    r.handle_future_salts(&future_salts_body(&salts, false));
+    assert_eq!(r.salt(), 5);
+    assert_eq!(r.future_salts.len(), 2, "the salt that ran out is forgotten");
+    // The server's clock reaches the next salt's valid_since.
+    r.set_time_offset(60);
+    r.rotate_salt();
+    assert_eq!(r.salt(), 6);
 }

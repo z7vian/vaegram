@@ -7,7 +7,7 @@ use tokio::time::Instant;
 
 use super::auth::Created;
 use super::internals::{self, SeqNo};
-use super::{Answer, Pending, Runner};
+use super::{Answer, FIRST_SALTS_AFTER, Pending, Runner};
 use crate::crypto::mtproto::{auth_key_id, encrypt_v1};
 use crate::crypto::random;
 use crate::errors::Error;
@@ -147,6 +147,9 @@ impl Runner {
         self.auth_key_id = auth_key_id(&key.auth_key);
         self.auth_key = key.auth_key;
         self.set_salt(key.salt);
+        // The old key's salts are no good under the new one; its own are asked for once it settles.
+        self.future_salts.clear();
+        self.salts_due = Instant::now() + FIRST_SALTS_AFTER;
         self.set_time_offset(key.time_offset);
         self.clock_synced = true;
         self.session_id = random();
