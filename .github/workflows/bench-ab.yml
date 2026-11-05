@@ -18,7 +18,16 @@ jobs:
         working-directory: ../base
       - name: alternate base and candidate
         run: |
-          for i in 1 2 3 4 5; do
-            (cd ../base && cargo bench --bench session) | grep -E 'cpu_ms_per_mib|rss_after' | sed "s/^/base $i /"
-            cargo bench --bench session | grep -E 'cpu_ms_per_mib|rss_after' | sed "s/^/cand $i /"
+          # The push stage of this bench sometimes loses a few pushes and stops the run before the transfer rows;
+          # such a run is tried again.
+          rows() {
+            for attempt in 1 2 3 4; do
+              out=$( (cd "$1" && cargo bench --bench session 2>/dev/null) | grep -E 'cpu_ms_per_mib_download"|rss_after' )
+              if [ -n "$out" ]; then echo "$out" | sed "s/^/$2 $3 /"; return; fi
+            done
+            echo "$2 $3 no rows"
+          }
+          for i in 1 2 3 4 5 6; do
+            rows ../base base $i
+            rows . cand $i
           done
