@@ -1,13 +1,15 @@
 #[cfg(feature = "dns-config")]
 mod dns_config;
 mod fake_tls;
-#[cfg(any(feature = "websocket", feature = "dns-config"))]
+#[cfg(any(feature = "websocket", feature = "dns-config", feature = "web-proxy"))]
 mod http1;
 mod obfuscated;
 mod proxy;
-#[cfg(any(feature = "websocket", feature = "dns-config"))]
+#[cfg(any(feature = "websocket", feature = "dns-config", feature = "web-proxy"))]
 mod tls;
 mod transport;
+#[cfg(feature = "web-proxy")]
+mod web_proxy;
 #[cfg(feature = "websocket")]
 mod websocket;
 
@@ -180,10 +182,7 @@ impl Connection {
 
     async fn open(dc: &Dc, options: &Options) -> Result<Self> {
         let addr = dc.addr;
-        let secret = match &options.proxy {
-            Some(Proxy::MtProxy { secret, .. }) => Some(secret),
-            _ => None,
-        };
+        let secret = options.proxy.as_ref().and_then(Proxy::secret);
         // The full transport sends no header to hide, so obfuscation has nothing to wrap, and an MTProxy only
         // understands the obfuscated ones.
         if options.transport == Transport::Full && (options.obfuscated || secret.is_some()) {
@@ -196,9 +195,15 @@ impl Connection {
             }
             return Self::open_websocket(dc, options, &websocket::Endpoint::of(dc)?).await;
         }
-        let (read, write) = match &options.connection_factory {
-            None => {
-                let stream = match &options.proxy {
+        let (read, write) = match (&options.connection_factory, &options.proxy) {
+            #[cfg(feature = "web-proxy")]
+            (factory, Some(Proxy::Web { host, secret })) => {
+                let stream: Box<dyn Stream> = Box::new(web_proxy::open(host, secret, factory.clone()).await?);
+                let (read, write) = tokio::io::split(stream);
+                (ReadHalf::Boxed(read), WriteHalf::Boxed(write))
+            }
+            (None, proxy) => {
+                let stream = match proxy {
                     None => TcpStream::connect(addr).await?,
                     Some(proxy) => {
                         let mut stream = TcpStream::connect(proxy.endpoint()).await?;
@@ -210,8 +215,8 @@ impl Connection {
                 let (read, write) = stream.into_split();
                 (ReadHalf::Tcp(read), WriteHalf::Tcp(write))
             }
-            Some(factory) => {
-                let mut stream = match &options.proxy {
+            (Some(factory), proxy) => {
+                let mut stream = match proxy {
                     None => factory.connect(addr).await?,
                     Some(proxy) => {
                         let mut stream = dial_any(factory.as_ref(), proxy.endpoint()).await?;
@@ -238,10 +243,7 @@ impl Connection {
 
     /// Sends what the transport starts with, the obfuscation header or the transport's tag, on a stream just opened.
     async fn start(dc: &Dc, options: &Options, read: ReadHalf, mut write: WriteHalf, obfuscate: bool) -> Result<Self> {
-        let secret = match &options.proxy {
-            Some(Proxy::MtProxy { secret, .. }) => Some(secret),
-            _ => None,
-        };
+        let secret = options.proxy.as_ref().and_then(Proxy::secret);
         let transport =
             if secret.is_some_and(|s| s.padded) { Transport::PaddedIntermediate } else { options.transport };
         let tls = secret.is_some_and(|s| s.domain.is_some());
