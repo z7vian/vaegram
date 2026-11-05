@@ -37,6 +37,13 @@ impl RecvBuf {
         }
         &mut self.data
     }
+
+    /// Frees the buffer when nothing is waiting in it and it grew past `keep` bytes.
+    pub(crate) fn shrink_idle(&mut self, keep: usize) {
+        if self.start == self.data.len() && self.data.capacity() > keep {
+            (self.data, self.start) = (Vec::new(), 0);
+        }
+    }
 }
 
 /// MTProto transport framing, see <https://core.telegram.org/mtproto/mtproto-transports>.
@@ -392,5 +399,22 @@ mod tests {
         let frame = [4u32.to_le_bytes(), i32::MIN.to_le_bytes()].concat();
         let read = trickle(Transport::Intermediate, &frame);
         assert!(matches!(read, Err(Error::Transport(i32::MAX))), "{read:?}");
+    }
+
+    #[test]
+    fn idle_buffers_shrink_after_a_big_packet() {
+        let keep = 256 << 10;
+        let mut buf = RecvBuf::default();
+        buf.extend_from_slice(&vec![0; 1 << 20]);
+        buf.shrink_idle(keep);
+        assert!(buf.data.capacity() >= 1 << 20, "bytes still wait, so the buffer stays");
+        buf.start = buf.data.len();
+        buf.shrink_idle(keep);
+        assert_eq!((buf.data.capacity(), buf.start), (0, 0));
+        // A small buffer is kept for the next packet.
+        buf.extend_from_slice(&[1; 64]);
+        buf.start = 64;
+        buf.shrink_idle(keep);
+        assert!(buf.data.capacity() >= 64);
     }
 }

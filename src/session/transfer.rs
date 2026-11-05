@@ -7,12 +7,12 @@ use std::task::Poll;
 use std::time::Duration;
 
 use super::internals::data_center::Dc;
-use super::{Events, Known, Salt, Session, WeakSession, init_connection};
+use super::{Body, Events, Known, Salt, Session, WeakSession, init_connection};
 use crate::client::quiet;
 use crate::connection::Options;
 use crate::crypto::rsa::PublicKey;
 use crate::errors::{Error, Result};
-use crate::raw::{RemoteCall, base, functions};
+use crate::raw::{Deserializable, Identifiable, RemoteCall, base, functions, types};
 
 const IDLE: Duration = Duration::from_secs(15);
 // Telegram's largest part, both ways.
@@ -210,29 +210,35 @@ pub(crate) fn per_connection(workers: usize, connections: usize) -> usize {
 
 /// One part on a transfer connection that carries `in_flight` parts at a time.
 pub(crate) async fn invoke_part<R: RemoteCall>(session: &Session, request: &R, in_flight: usize) -> Result<R::Return> {
-    invoke_part_on(session, request, in_flight, false).await
+    Ok(R::Return::from_bytes(&invoke_part_on(session, request, in_flight, false).await?)?)
 }
 
+/// `invoke_part` for `upload.getFile`, read in place; `request` may be wrapped, as in a takeout session.
+pub(crate) async fn invoke_file_part<R: RemoteCall>(
+    session: &Session,
+    request: &R,
+    in_flight: usize,
+) -> Result<FileAnswer> {
+    FileAnswer::read(invoke_part_on(session, request, in_flight, false).await?)
+}
+
+/// `invoke_part` for a CDN, which gets its own cap on flood waits; `request` is `upload.getCdnFile`, maybe inside
+/// initConnection.
 pub(crate) async fn invoke_cdn_part<R: RemoteCall>(
     session: &Session,
     request: &R,
     in_flight: usize,
-) -> Result<R::Return> {
-    invoke_part_on(session, request, in_flight, true).await
+) -> Result<CdnAnswer> {
+    CdnAnswer::read(invoke_part_on(session, request, in_flight, true).await?)
 }
 
-async fn invoke_part_on<R: RemoteCall>(
-    session: &Session,
-    request: &R,
-    in_flight: usize,
-    cdn: bool,
-) -> Result<R::Return> {
+async fn invoke_part_on<R: RemoteCall>(session: &Session, request: &R, in_flight: usize, cdn: bool) -> Result<Body> {
     // Parts go straight to their session, so the user's request_timeout still has to count.
     let timeout = part_timeout(in_flight).max(session.options().request_timeout);
     let cap = cdn.then_some(MAX_CDN_FLOOD_WAIT);
     let (mut timeouts, mut retries, mut slept) = (0, 0u32, Duration::ZERO);
     loop {
-        let result = session.invoke_with_timeout(request, timeout).await;
+        let result = session.invoke_body(request, timeout).await;
         let retry = result.as_ref().err().map(|e| session.should_retry(R::NAME, e, retries + 1, slept, cap));
         match (&result, retry) {
             (_, Some(ControlFlow::Continue(wait))) => {
@@ -243,6 +249,112 @@ async fn invoke_part_on<R: RemoteCall>(
             // Timeouts get their own retries whatever the policy thinks of them.
             (Err(Error::Timeout), _) if timeouts + 1 < MAX_TIMEOUTS => timeouts += 1,
             _ => return result,
+        }
+    }
+}
+
+/// A file part's bytes, left in the answer they came in: `range` of `buf`.
+#[derive(Debug)]
+pub(crate) struct FilePart {
+    buf: Vec<u8>,
+    range: std::ops::Range<usize>,
+}
+
+impl FilePart {
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.buf[self.range.clone()]
+    }
+
+    /// Keeps the first `len` bytes.
+    pub(crate) fn truncate(&mut self, len: usize) {
+        self.range.end = self.range.start + len.min(self.range.len());
+    }
+
+    /// Drops the first `n` bytes.
+    pub(crate) fn skip(&mut self, n: usize) {
+        self.range.start += n.min(self.range.len());
+    }
+
+    /// The bytes on their own: the buffer cut to them, moving them to its front rather than copying them out.
+    pub(crate) fn into_vec(mut self) -> Vec<u8> {
+        self.buf.truncate(self.range.end);
+        self.buf.drain(..self.range.start);
+        self.buf
+    }
+
+    /// The TL `bytes` `at` bytes into `body`, or `None` if they run past its end.
+    fn at(body: Body, at: usize) -> Option<FilePart> {
+        let (buf, start) = body.into_parts();
+        let at = start.checked_add(at)?;
+        let (data, len) = match *buf.get(at)? {
+            254 => (at + 4, u32::from_le_bytes([*buf.get(at + 1)?, *buf.get(at + 2)?, *buf.get(at + 3)?, 0])),
+            len @ 0..=253 => (at + 1, u32::from(len)),
+            _ => return None,
+        };
+        let end = data.checked_add(usize::try_from(len).ok()?)?;
+        (end <= buf.len()).then_some(FilePart { buf, range: data..end })
+    }
+}
+
+impl std::ops::Deref for FilePart {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.buf[self.range.clone()]
+    }
+}
+
+impl PartialEq<Vec<u8>> for FilePart {
+    fn eq(&self, other: &Vec<u8>) -> bool {
+        **self == **other
+    }
+}
+
+impl From<Vec<u8>> for FilePart {
+    fn from(buf: Vec<u8>) -> FilePart {
+        let range = 0..buf.len();
+        FilePart { buf, range }
+    }
+}
+
+const UPLOAD_FILE: u32 = <types::upload::File as Identifiable>::CONSTRUCTOR_ID;
+const CDN_FILE: u32 = <types::upload::CdnFile as Identifiable>::CONSTRUCTOR_ID;
+
+/// What `upload.getFile` answers.
+pub(crate) enum FileAnswer {
+    Part(FilePart),
+    Redirect(Box<types::upload::FileCdnRedirect>),
+}
+
+impl FileAnswer {
+    /// `upload.file type:storage.FileType mtime:int bytes:bytes` is read by hand, so its bytes stay where they are:
+    /// the file type is a bare constructor id and the mtime an int, then come the bytes.
+    fn read(body: Body) -> Result<FileAnswer> {
+        if body.get(..4) == Some(&UPLOAD_FILE.to_le_bytes()[..]) {
+            return FilePart::at(body, 12).map(FileAnswer::Part).ok_or(Error::Unexpected("upload.file is cut short"));
+        }
+        match base::upload::File::from_bytes(&body)? {
+            base::upload::File::File(f) => Ok(FileAnswer::Part(f.bytes.into())),
+            base::upload::File::FileCdnRedirect(r) => Ok(FileAnswer::Redirect(r)),
+        }
+    }
+}
+
+/// What `upload.getCdnFile` answers.
+pub(crate) enum CdnAnswer {
+    Part(FilePart),
+    ReuploadNeeded(Vec<u8>),
+}
+
+impl CdnAnswer {
+    /// `upload.cdnFile bytes:bytes`, read by hand like `upload.file`.
+    fn read(body: Body) -> Result<CdnAnswer> {
+        if body.get(..4) == Some(&CDN_FILE.to_le_bytes()[..]) {
+            return FilePart::at(body, 4).map(CdnAnswer::Part).ok_or(Error::Unexpected("upload.cdnFile is cut short"));
+        }
+        match base::upload::CdnFile::from_bytes(&body)? {
+            base::upload::CdnFile::CdnFile(f) => Ok(CdnAnswer::Part(f.bytes.into())),
+            base::upload::CdnFile::CdnFileReuploadNeeded(r) => Ok(CdnAnswer::ReuploadNeeded(r.request_token)),
         }
     }
 }
@@ -661,5 +773,39 @@ mod tests {
         assert!(flooded.0 && second.0 && third.0);
         assert!(flooded.1 >= wait && second.1 >= wait && third.1 >= wait, "{flooded:?} {second:?} {third:?}");
         assert_eq!(std::iter::from_fn(|| sent.try_recv().ok()).count(), 4);
+    }
+
+    #[test]
+    fn file_part_points_into_the_packet() {
+        use super::{Body, CdnAnswer, FileAnswer};
+        // 300 bytes take TL's long length prefix.
+        let file = types::upload::File { r#type: base::storage::FileType::FilePartial, mtime: 7, bytes: vec![5; 300] };
+        let mut packet = vec![0; 16];
+        packet.extend(base::upload::File::File(Box::new(file)).to_bytes());
+        let start = packet.as_ptr() as usize;
+        let end = start + packet.len();
+        let Ok(FileAnswer::Part(part)) = FileAnswer::read(Body::new(packet, 16)) else { panic!("not a file part") };
+        assert_eq!(part, vec![5; 300]);
+        assert!((start..end).contains(&(part.as_ptr() as usize)), "the part was copied out");
+        // On its own, the part moves to the front of the buffer it came in.
+        let bytes = part.into_vec();
+        assert_eq!(bytes.as_ptr() as usize, start);
+        assert_eq!(bytes, vec![5; 300]);
+
+        let cdn =
+            base::upload::CdnFile::CdnFile(Box::new(types::upload::CdnFile { bytes: b"abc".to_vec() })).to_bytes();
+        let Ok(CdnAnswer::Part(part)) = CdnAnswer::read(Body::from(cdn.clone())) else { panic!("not a CDN part") };
+        assert_eq!(part, b"abc".to_vec());
+        assert!(CdnAnswer::read(Body::from(cdn[..6].to_vec())).is_err(), "cut short");
+        let redirect = base::upload::File::FileCdnRedirect(Box::new(types::upload::FileCdnRedirect {
+            dc_id: 5,
+            file_token: Vec::new(),
+            encryption_key: Vec::new(),
+            encryption_iv: Vec::new(),
+            file_hashes: Vec::new(),
+        }));
+        assert!(
+            matches!(FileAnswer::read(Body::from(redirect.to_bytes())), Ok(FileAnswer::Redirect(r)) if r.dc_id == 5)
+        );
     }
 }

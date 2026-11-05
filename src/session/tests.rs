@@ -1258,3 +1258,61 @@ async fn leased_connections_are_numbered_apart() {
     seen.sort_unstable();
     assert_eq!(seen, [(4, 1, 0), (4, 2, 0)]);
 }
+
+// A message from the server under the runner's key; `n` keeps msg_ids apart.
+fn from_server(r: &Runner, n: i64, body: &[u8]) -> Vec<u8> {
+    let msg_id = (internals::now() << 32) | (4 * n + 1);
+    super::replay::seal(&r.auth_key, &r.auth_key_id, &r.session_id, msg_id, 1, body)
+}
+
+fn container(messages: &[(i64, &[u8])]) -> Vec<u8> {
+    let mut out = [msg_container::ID.to_le_bytes(), (messages.len() as u32).to_le_bytes()].concat();
+    for (msg_id, body) in messages {
+        out.extend_from_slice(&msg_id.to_le_bytes());
+        out.extend_from_slice(&1i32.to_le_bytes());
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        out.extend_from_slice(body);
+    }
+    out
+}
+
+#[tokio::test]
+async fn rpc_result_answer_reuses_the_packet() {
+    let (mut r, _frames, _updates) = runner().await;
+    let mut answered = request(&mut r, ping(1));
+    r.flush().await.unwrap();
+    let req_msg_id = *r.pending.keys().next().unwrap();
+    let pong = types::Pong { msg_id: req_msg_id, ping_id: 1 }.to_bytes();
+    let packet = from_server(&r, 0, &rpc_result(req_msg_id, &pong));
+    let start = packet.as_ptr() as usize;
+    let end = start + packet.len();
+    r.handle_packet(packet).await.unwrap();
+    let body = answered.try_recv().unwrap().unwrap();
+    assert_eq!(body, &pong[..]);
+    assert!((start..end).contains(&(body.as_ptr() as usize)), "the answer was copied out of the packet");
+}
+
+#[tokio::test]
+async fn container_answers_still_copy() {
+    let (mut r, _frames, _updates) = runner().await;
+    let mut answered = request(&mut r, ping(1));
+    r.flush().await.unwrap();
+    let req_msg_id = *r.pending.keys().next().unwrap();
+    let pong = types::Pong { msg_id: req_msg_id, ping_id: 1 }.to_bytes();
+    let inner = (internals::now() << 32) | 9;
+    let answer = rpc_result(req_msg_id, &pong);
+    let packet = from_server(&r, 0, &container(&[(inner, &answer[..])]));
+    let start = packet.as_ptr() as usize;
+    let end = start + packet.len();
+    r.handle_packet(packet).await.unwrap();
+    let body = answered.try_recv().unwrap().unwrap();
+    assert_eq!(body, &pong[..]);
+    assert!(!(start..end).contains(&(body.as_ptr() as usize)));
+    // An rpc_error in a plain packet still comes back as the error it is.
+    let mut failed = request(&mut r, ping(2));
+    r.flush().await.unwrap();
+    let req_msg_id = *r.pending.keys().next().unwrap();
+    let error = types::RpcError { error_code: 400, error_message: b"PEER_ID_INVALID".to_vec() }.to_bytes();
+    r.handle_packet(from_server(&r, 3, &rpc_result(req_msg_id, &error))).await.unwrap();
+    assert!(matches!(failed.try_recv().unwrap(), Err(Error::Rpc(e)) if e.is("PEER_ID_INVALID")));
+}

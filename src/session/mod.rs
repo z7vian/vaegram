@@ -72,7 +72,54 @@ const KEY_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(20);
 const TICK: Duration = Duration::from_secs(1);
 const ACK_EVERY: Duration = Duration::from_secs(15);
 
-type Answer = Result<Vec<u8>>;
+type Answer = Result<Body>;
+
+/// An answer's bytes. A plain rpc_result keeps them in the packet they came in, from `at` on, instead of copying
+/// them out; other answers own exactly their bytes.
+#[derive(Debug, Clone)]
+pub(crate) struct Body {
+    buf: Vec<u8>,
+    at: usize,
+}
+
+impl Body {
+    /// The bytes of `buf` from `at` on (none past its end).
+    fn new(buf: Vec<u8>, at: usize) -> Body {
+        let at = at.min(buf.len());
+        Body { buf, at }
+    }
+
+    /// The buffer and where the answer starts in it.
+    pub(crate) fn into_parts(self) -> (Vec<u8>, usize) {
+        (self.buf, self.at)
+    }
+}
+
+impl From<Vec<u8>> for Body {
+    fn from(buf: Vec<u8>) -> Body {
+        Body { buf, at: 0 }
+    }
+}
+
+impl std::ops::Deref for Body {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.buf[self.at..]
+    }
+}
+
+impl PartialEq for Body {
+    fn eq(&self, other: &Body) -> bool {
+        **self == **other
+    }
+}
+
+impl PartialEq<&[u8]> for Body {
+    fn eq(&self, other: &&[u8]) -> bool {
+        **self == **other
+    }
+}
 
 struct Request {
     name: &'static str,
@@ -284,7 +331,7 @@ impl Session {
             while let Some(request) = rx.recv().await {
                 let _ = bodies.send(request.body);
                 if let Some(reply) = replies.next() {
-                    let _ = request.answer.send(reply);
+                    let _ = request.answer.send(reply.map(Body::from));
                 }
             }
         });
@@ -429,12 +476,17 @@ impl Session {
     /// A request that times out is forgotten: the server is asked not to send its answer, and the connection
     /// carries on.
     pub async fn invoke_with_timeout<R: RemoteCall>(&self, request: &R, timeout: Duration) -> Result<R::Return> {
+        let body = self.invoke_body(request, timeout).await?;
+        Ok(R::Return::from_bytes(&body)?)
+    }
+
+    /// `invoke_with_timeout` that hands back the answer's bytes, for a caller that reads them in place.
+    pub(crate) async fn invoke_body<R: RemoteCall>(&self, request: &R, timeout: Duration) -> Result<Body> {
         let (answer, rx) = oneshot::channel();
         let request = Request { name: R::NAME, body: request.to_bytes(), answer };
         self.requests.send(request).map_err(|_| Error::Disconnected)?;
         let answer = tokio::time::timeout(timeout, rx).await.map_err(|_| Error::Timeout)?;
-        let body = answer.map_err(|_| Error::Disconnected)??;
-        Ok(R::Return::from_bytes(&body)?)
+        answer.map_err(|_| Error::Disconnected)?
     }
 }
 
@@ -796,6 +848,11 @@ impl Runner {
             }
         }
         self.drop_abandoned();
+        // Between transfers the buffers a big packet grew give their memory back; a part in flight keeps them.
+        if self.pending.is_empty() {
+            self.reader.shrink_idle();
+            self.writer.shrink_idle();
+        }
         if self.service.is_empty() && !self.bind_due() { Ok(()) } else { self.flush().await }
     }
 
@@ -970,7 +1027,7 @@ impl Runner {
             self.events.emit(ClientEvent::PacketDropped { reason: "failed decryption or the MTProto checks" });
             return Ok(());
         };
-        let body = &packet[at];
+        let body = &packet[at.clone()];
         if !self.fresh(msg_id, body) {
             return Ok(());
         }
@@ -985,6 +1042,11 @@ impl Runner {
                 }
                 Err(_) => self.events.emit(ClientEvent::PacketDropped { reason: "bad msg_container" }),
             }
+        } else if let Some(req_msg_id) = plain_result(body) {
+            self.note(msg_id, seq_no, body);
+            // The answer stays where it was decrypted: the packet is cut after it and read from its start on.
+            packet.truncate(at.end);
+            self.answer_result(req_msg_id, Body::new(packet, at.start + 12));
         } else {
             self.handle_message(msg_id, seq_no, body);
         }
@@ -1011,12 +1073,7 @@ impl Runner {
     }
 
     fn handle_message(&mut self, msg_id: i64, seq_no: i32, body: &[u8]) {
-        if let Some(Err(error)) = self.options.record.as_ref().map(|r| r.record(false, msg_id, body)) {
-            self.events.emit(ClientEvent::RecordingFailed { error });
-        }
-        if seq_no % 2 == 1 {
-            self.acks.push(msg_id);
-        }
+        self.note(msg_id, seq_no, body);
         let unpacked;
         let body = if constructor_id(body) == Some(gzip_packed::ID) {
             let Ok(b) = gzip_packed::unpack(body) else {
@@ -1035,7 +1092,7 @@ impl Runner {
             Some(MSGS_ACK) => self.handle_msgs_ack(body),
             Some(PONG) => {
                 if let Ok(base::Pong::Pong(p)) = base::Pong::from_bytes(body) {
-                    self.answer(p.msg_id, Ok(body.to_vec()));
+                    self.answer(p.msg_id, Ok(Body::from(body.to_vec())));
                 }
             }
             Some(MSGS_STATE_REQ) => self.handle_state_req(msg_id, body),
@@ -1063,20 +1120,48 @@ impl Runner {
                 }
             }
         }
-        let answer = if constructor_id(&result) == Some(RPC_ERROR) {
-            match base::RpcError::from_bytes(&result) {
-                Ok(base::RpcError::RpcError(e)) => {
-                    Err(Error::Rpc(RpcError::new(e.error_code, &String::from_utf8_lossy(&e.error_message))))
-                }
-                Err(e) => Err(e.into()),
+        if constructor_id(&result) != Some(RPC_ERROR) {
+            return self.answer_result(req_msg_id, Body::from(result));
+        }
+        let answer = match base::RpcError::from_bytes(&result) {
+            Ok(base::RpcError::RpcError(e)) => {
+                Err(Error::Rpc(RpcError::new(e.error_code, &String::from_utf8_lossy(&e.error_message))))
             }
-        } else {
-            self.deliver(&result, true);
-            Ok(result)
+            Err(e) => Err(e.into()),
         };
         if let Some(answer) = self.bind_answered(req_msg_id, answer) {
             self.answer(req_msg_id, answer);
         }
+    }
+
+    /// Records a message and queues its ack when it wants one.
+    fn note(&mut self, msg_id: i64, seq_no: i32, body: &[u8]) {
+        if let Some(Err(error)) = self.options.record.as_ref().map(|r| r.record(false, msg_id, body)) {
+            self.events.emit(ClientEvent::RecordingFailed { error });
+        }
+        if seq_no % 2 == 1 {
+            self.acks.push(msg_id);
+        }
+    }
+
+    fn answer_result(&mut self, req_msg_id: i64, result: Body) {
+        self.deliver(&result, true);
+        if let Some(answer) = self.bind_answered(req_msg_id, Ok(result)) {
+            self.answer(req_msg_id, answer);
+        }
+    }
+}
+
+/// The request a plain rpc_result answers: one whose result is neither an rpc_error nor gzip_packed, so it can be
+/// handed on as it lies in the packet.
+fn plain_result(body: &[u8]) -> Option<i64> {
+    if constructor_id(body) != Some(RPC_RESULT) {
+        return None;
+    }
+    let req_msg_id = i64::from_le_bytes(body.get(4..12)?.try_into().ok()?);
+    match constructor_id(body.get(12..)?)? {
+        RPC_ERROR | gzip_packed::ID => None,
+        _ => Some(req_msg_id),
     }
 }
 
